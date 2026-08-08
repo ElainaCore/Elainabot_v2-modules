@@ -362,7 +362,7 @@ class AgentRuntime:
             handler = self.service.capability_handler(item['key'])
             if handler is None:
                 return {'ok': False, 'error': '插件能力当前不在线'}
-            value = handler(name, arguments)
+            value = handler(item['id'], arguments)
             return await value if asyncio.iscoroutine(value) else value
         return None
 

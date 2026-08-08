@@ -3,6 +3,7 @@ import {
   readPluginCapabilities, setState, state, streamApi, toast,
 } from './core.js';
 import { bindProviders, renderProviders } from './providers.js';
+import { bindLogs, loadLogs } from './logs.js';
 
 function renderAll() {
   renderCommon();
@@ -28,6 +29,7 @@ function showPage(page) {
   const active = document.querySelector('.nav button.active');
   $('page-title').textContent = active ? active.textContent.trim() : page;
   if (window.matchMedia('(max-width: 600px)').matches) $('app').classList.add('sidebar-collapsed');
+  if (page === 'logs') loadLogs().catch(error => toast(error.message, true));
 }
 
 document.querySelectorAll('.nav button').forEach(button => button.onclick = () => showPage(button.dataset.page));
@@ -51,17 +53,19 @@ $('add-mcp').onclick = () => {
 };
 $('add-cron').onclick = () => addItem('cron_jobs', {id: 'cron-' + Date.now(), name: '新任务', cron: '', interval_seconds: 3600, prompt: '', provider_id: '', model: '', enabled: true});
 $('refresh-mcp').onclick = async () => {
-  try { await saveConfigSection('capabilities'); const data = await api('/mcp/refresh', {method: 'POST'}); await loadAll(); toast('已注册 ' + data.tools.length + ' 个 MCP 工具'); }
+  try { await saveConfigSection('mcp'); const data = await api('/mcp/refresh', {method: 'POST'}); await loadAll(); toast('已注册 ' + data.tools.length + ' 个 MCP 工具'); }
   catch (error) { toast(error.message, true); }
 };
-$('save-plugin-capabilities').onclick = async () => {
+document.querySelectorAll('.save-plugin-capabilities').forEach(button => button.onclick = async () => {
+  button.disabled = true;
   try {
     const data = await api('/plugin-capabilities', {method: 'PUT', body: JSON.stringify({items: readPluginCapabilities()})});
     setState({...state, plugin_capabilities: data.items || []});
     renderAll();
-    toast('插件能力授权已保存');
+    toast('插件能力设置已保存');
   } catch (error) { toast(error.message, true); }
-};
+  finally { button.disabled = false; }
+});
 $('test-provider').onchange = renderTestModels;
 $('run-test').onclick = async () => {
   const button = $('run-test');
@@ -90,4 +94,5 @@ $('interrupt-test').onclick = async () => {
   try { const data = await api('/interrupt', {method: 'POST', body: JSON.stringify({session_id: 'web:ai-service-test'})}); toast(data.interrupted ? '已发送中断' : '当前没有运行中的任务'); }
   catch (error) { toast(error.message, true); }
 };
+bindLogs();
 loadAll().catch(error => toast(error.message, true));

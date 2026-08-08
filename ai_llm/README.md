@@ -43,7 +43,7 @@ async def ask_ai(text: str) -> str:
 
 ## 插件能力注入
 
-插件可以把 `skill`、`agent`、`mcp` 或 `tool` 注册到中央运行时。能力会记录来源插件，默认只允许来源插件自身使用；管理员可在 AI LLM 面板中改为共享给全部插件，或填写允许使用的插件 ID。
+插件可以把 `skill`、`agent`、`mcp` 或 `tool` 注册到中央运行时。能力会记录来源插件，默认只允许来源插件自身使用；管理员可在 AI LLM 面板中开启“允许其他插件使用”。
 
 ```python
 service.register_plugin_capability('my_plugin', 'skill', {
@@ -80,6 +80,8 @@ result = await service.complete(
 
 未传 `consumer_plugin` 的调用不会获得任何插件注入能力。模块只接受公网 HTTPS MCP 地址，并拒绝回环、内网、链路本地和云元数据地址。
 
+插件可调用 `service.list_capabilities('my_plugin')` 获取已在线且有权使用的能力摘要；需要发现 MCP 工具清单时调用 `await service.discover_capabilities('my_plugin')`。执行能力使用 `await service.call_capability('my_plugin', capability_key, arguments)`。
+
 ## 工具调用
 
 插件可以传入 OpenAI 格式的 `tools`，并提供异步 `tool_handler(name, arguments)`：
@@ -94,6 +96,12 @@ result = await service.complete(
 ```
 
 工具的权限控制、参数校验和返回内容过滤仍由插件负责。涉及网络访问时，应拒绝回环、内网、链路本地及云元数据地址，避免泄露服务器网络信息。
+
+## 调用日志
+
+Web 面板的“调用日志”页面持久化最近 500 次 LLM 调用。每条日志包含调用插件与会话、请求候选链路、接口和模型、OpenAI 请求/响应正文、HTTP 状态与响应头、首字耗时、总耗时、输入/输出/总 Token、生成速度、请求和响应字节数、故障切换事件，以及每次工具调用的参数、结果、状态和耗时。
+
+`Authorization`、API Key、Cookie、Token、Secret 和 Password 等敏感字段会在写入前脱敏。日志接口为 `GET /api/ext/ai-service/logs`，传入 `run_id` 可读取详情；`DELETE /api/ext/ai-service/logs` 用于清空日志。
 
 ## 已接入插件
 

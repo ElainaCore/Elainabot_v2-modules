@@ -34,6 +34,7 @@ _ASSET_FILES = {
     'core.js': 'text/javascript',
     'providers.js': 'text/javascript',
     'app.js': 'text/javascript',
+    'logs.js': 'text/javascript',
 }
 
 
@@ -69,6 +70,8 @@ async def setup(ctx):
     register_route('PUT', f'{PREFIX}/plugin-capabilities', _save_plugin_capabilities)
     register_route('POST', f'{PREFIX}/mcp/refresh', _mcp_refresh)
     register_route('POST', f'{PREFIX}/interrupt', _interrupt)
+    register_route('GET', f'{PREFIX}/logs', _logs)
+    register_route('DELETE', f'{PREFIX}/logs', _clear_logs)
     for filename in _ASSET_FILES:
         register_route('GET', f'{PREFIX}/assets/{filename}', _asset, auth=False)
     register_page(
@@ -103,6 +106,8 @@ async def teardown():
         ('PUT', f'{PREFIX}/plugin-capabilities'),
         ('POST', f'{PREFIX}/mcp/refresh'),
         ('POST', f'{PREFIX}/interrupt'),
+        ('GET', f'{PREFIX}/logs'),
+        ('DELETE', f'{PREFIX}/logs'),
     ):
         unregister_route(method, path)
     for filename in _ASSET_FILES:
@@ -256,6 +261,34 @@ async def _interrupt(request):
         return web.json_response({'success': False, 'error': '缺少 run_id 或 session_id'}, status=400)
     stopped = _service().runtime.interrupt(target)
     return web.json_response({'success': True, 'data': {'interrupted': stopped}})
+
+
+async def _logs(request):
+    run_id = str(request.query.get('run_id') or '').strip()
+    if run_id:
+        value = _service().audit.get(run_id)
+        if value is None:
+            return web.json_response({'success': False, 'error': '调用日志不存在'}, status=404)
+        return web.json_response({'success': True, 'data': value})
+    try:
+        limit = int(request.query.get('limit') or 100)
+    except ValueError:
+        limit = 100
+    values = _service().audit.list(
+        limit=limit,
+        status=str(request.query.get('status') or ''),
+        provider=str(request.query.get('provider') or ''),
+        search=str(request.query.get('search') or ''),
+    )
+    return web.json_response({
+        'success': True,
+        'data': {'items': values, 'stats': _service().audit.stats()},
+    })
+
+
+async def _clear_logs(_request):
+    _service().audit.clear()
+    return web.json_response({'success': True, 'data': {'cleared': True}})
 
 
 async def _refresh_models(force: bool = False) -> dict:

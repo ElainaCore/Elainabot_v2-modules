@@ -4,12 +4,15 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from xml.etree import ElementTree
 
 import aiohttp
 
+from .audit import InvocationAudit
 from .runtime import AgentRuntime
 
 ToolHandler = Callable[[str, dict], Awaitable[dict] | dict]
@@ -17,6 +20,108 @@ ToolHandler = Callable[[str, dict], Awaitable[dict] | dict]
 
 class AIServiceError(RuntimeError):
     pass
+
+
+def _xml_scalar(value: str):
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    if text.lower() == 'true':
+        return True
+    if text.lower() == 'false':
+        return False
+    if text.lower() == 'null':
+        return None
+    if text[:1] in ('{', '[', '"') or re.fullmatch(r'-?(?:\d+\.?\d*|\.\d+)', text):
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return text
+
+
+def _xml_element_value(element: ElementTree.Element):
+    children = list(element)
+    if not children:
+        return _xml_scalar(element.text or '')
+    result = {}
+    for child in children:
+        value = _xml_element_value(child)
+        if child.tag in result:
+            if not isinstance(result[child.tag], list):
+                result[child.tag] = [result[child.tag]]
+            result[child.tag].append(value)
+        else:
+            result[child.tag] = value
+    return result
+
+
+def _xml_tool_calls(content: str, tools: list[dict] | None) -> tuple[list[dict], str]:
+    """Convert XML-style calls emitted by some compatible endpoints into tool calls.
+
+    Only names present in the supplied tool schema are accepted. Complete XML blocks
+    are parsed with ElementTree; a bare opening tag is accepted only for a tool with
+    no required arguments.
+    """
+    if not content or not tools or '<' not in content:
+        return [], content
+    definitions = {}
+    for item in tools:
+        function = item.get('function', {}) if isinstance(item, dict) else {}
+        name = str(function.get('name') or '')
+        if name:
+            parameters = function.get('parameters') or {}
+            definitions[name] = set(parameters.get('required') or [])
+    if not definitions:
+        return [], content
+
+    matches: list[tuple[int, int, str, dict]] = []
+    occupied: list[tuple[int, int]] = []
+    for name in definitions:
+        escaped = re.escape(name)
+        block_pattern = re.compile(
+            rf'<{escaped}\s*>(.*?)</{escaped}\s*>', re.IGNORECASE | re.DOTALL,
+        )
+        for match in block_pattern.finditer(content):
+            try:
+                root = ElementTree.fromstring(match.group(0))
+                value = _xml_element_value(root)
+                arguments = value if isinstance(value, dict) else {}
+            except ElementTree.ParseError:
+                continue
+            matches.append((match.start(), match.end(), name, arguments))
+            occupied.append((match.start(), match.end()))
+        self_pattern = re.compile(rf'<{escaped}\s*/>', re.IGNORECASE)
+        for match in self_pattern.finditer(content):
+            matches.append((match.start(), match.end(), name, {}))
+            occupied.append((match.start(), match.end()))
+
+    def is_occupied(position: int) -> bool:
+        return any(start <= position < end for start, end in occupied)
+
+    for name, required in definitions.items():
+        if required:
+            continue
+        opening_pattern = re.compile(rf'<{re.escape(name)}\s*>', re.IGNORECASE)
+        for match in opening_pattern.finditer(content):
+            if not is_occupied(match.start()):
+                matches.append((match.start(), match.end(), name, {}))
+
+    matches.sort(key=lambda item: item[0])
+    calls = []
+    cleaned = content
+    for start, end, name, arguments in matches[:8]:
+        calls.append({
+            'id': f'xml_{uuid.uuid4().hex}',
+            'type': 'function',
+            'function': {
+                'name': name,
+                'arguments': json.dumps(arguments, ensure_ascii=False),
+            },
+        })
+    for start, end, _name, _arguments in sorted(matches[:8], reverse=True):
+        cleaned = cleaned[:start] + cleaned[end:]
+    return calls, cleaned.strip()
 
 
 DEFAULT_CONFIG = {
@@ -217,7 +322,6 @@ def normalize_config(value: dict | None) -> dict:
         if key in seen_capabilities:
             continue
         seen_capabilities.add(key)
-        allowed = raw.get('allowed_plugins', [])
         capabilities.append({
             'key': key,
             'id': capability_id,
@@ -226,10 +330,8 @@ def normalize_config(value: dict | None) -> dict:
             'name': str(raw.get('name') or capability_id).strip()[:100],
             'description': str(raw.get('description') or '').strip()[:500],
             'enabled': bool(raw.get('enabled', True)),
-            'shared': bool(raw.get('shared', False)),
-            'allowed_plugins': list(dict.fromkeys(
-                str(item).strip()[:128] for item in allowed if str(item).strip()
-            ))[:100] if isinstance(allowed, list) else [],
+            'shared': bool(raw.get('shared', True)),
+            'shared_configured': bool(raw.get('shared_configured', False)),
             'content': str(raw.get('content') or '')[:30000],
             'config': copy.deepcopy(raw.get('config')) if isinstance(raw.get('config'), dict) else {},
         })
@@ -268,6 +370,7 @@ class AIService:
                 if isinstance(health, dict):
                     self._health[(provider['id'], model)] = copy.deepcopy(health)
         self.runtime = AgentRuntime(self, data_dir or '.')
+        self.audit = InvocationAudit(data_dir or '.')
 
     @staticmethod
     def _capability_allowed(item: dict, consumer_plugin: str = '') -> bool:
@@ -279,7 +382,6 @@ class AIService:
         return (
             consumer == item.get('source_plugin')
             or bool(item.get('shared'))
-            or consumer in set(item.get('allowed_plugins') or [])
         )
 
     def plugin_capabilities(
@@ -293,12 +395,8 @@ class AIService:
                 continue
             value = copy.deepcopy(item)
             value['online'] = value['key'] in self._online_capabilities
-            if public and value['kind'] == 'mcp':
-                config = value.get('config', {})
-                headers = config.get('headers', {}) if isinstance(config, dict) else {}
-                if isinstance(headers, dict):
-                    config['headers_set'] = bool(headers)
-                    config['headers'] = {str(key): '********' for key in headers}
+            if public:
+                value.pop('config', None)
             result.append(value)
         return result
 
@@ -317,17 +415,23 @@ class AIService:
         incoming = copy.deepcopy(definition or {})
         incoming.update({'key': key, 'id': capability_id, 'kind': capability_kind, 'source_plugin': source})
         if current is not None:
-            for field in ('enabled', 'shared', 'allowed_plugins', 'content', 'config'):
+            for field in ('enabled', 'content'):
                 if field in current:
                     incoming[field] = copy.deepcopy(current[field])
+            if current.get('shared_configured'):
+                incoming['shared'] = bool(current.get('shared'))
+                incoming['shared_configured'] = True
+            else:
+                incoming.setdefault('shared', True)
+                incoming['shared_configured'] = False
             records = [
                 incoming if item.get('key') == key else item
                 for item in self._config.get('plugin_capabilities', [])
             ]
         else:
             incoming.setdefault('enabled', True)
-            incoming.setdefault('shared', False)
-            incoming.setdefault('allowed_plugins', [])
+            incoming.setdefault('shared', True)
+            incoming.setdefault('shared_configured', False)
             records = [*self._config.get('plugin_capabilities', []), incoming]
         merged = copy.deepcopy(self._config)
         merged['plugin_capabilities'] = records
@@ -355,21 +459,11 @@ class AIService:
             for current in self._config.get('plugin_capabilities', []):
                 update = updates.get(current.get('key'), {})
                 value = copy.deepcopy(current)
-                for field in ('enabled', 'shared', 'allowed_plugins', 'content', 'config'):
+                for field in ('enabled', 'shared', 'content'):
                     if field in update:
                         value[field] = copy.deepcopy(update[field])
-                if value.get('kind') == 'mcp' and isinstance(value.get('config'), dict):
-                    config = value['config']
-                    previous = current.get('config', {}) if isinstance(current.get('config'), dict) else {}
-                    headers = config.get('headers', {})
-                    if (
-                        config.get('headers_set')
-                        and isinstance(headers, dict)
-                        and headers
-                        and all(item == '********' for item in headers.values())
-                    ):
-                        config['headers'] = copy.deepcopy(previous.get('headers', {}))
-                    config.pop('headers_set', None)
+                if 'shared' in update:
+                    value['shared_configured'] = True
                 records.append(value)
             merged = copy.deepcopy(self._config)
             merged['plugin_capabilities'] = records
@@ -379,6 +473,90 @@ class AIService:
 
     def capability_handler(self, key: str):
         return self._capability_handlers.get(str(key or ''))
+
+    def list_capabilities(self, consumer_plugin: str, kind: str = '') -> list[dict]:
+        """List online capabilities that a plugin may discover and call."""
+        result = []
+        for item in self.plugin_capabilities(
+            consumer_plugin=consumer_plugin, kind=str(kind or '').lower(),
+        ):
+            if not item.get('online'):
+                continue
+            value = {
+                key: copy.deepcopy(item.get(key))
+                for key in (
+                    'key', 'id', 'kind', 'source_plugin', 'name', 'description',
+                    'enabled', 'shared', 'online',
+                )
+            }
+            if item.get('kind') == 'tool':
+                value['input_schema'] = copy.deepcopy(
+                    (item.get('config') or {}).get('schema') or {
+                        'type': 'object', 'properties': {},
+                    }
+                )
+            result.append(value)
+        return result
+
+    async def discover_capabilities(
+        self, consumer_plugin: str, kind: str = '',
+    ) -> list[dict]:
+        """Discover callable capabilities, including tools exposed by MCP entries."""
+        result = self.list_capabilities(consumer_plugin, kind)
+        if not kind or str(kind).lower() == 'mcp':
+            discovered = await self.runtime.refresh_plugin_mcp_tools(consumer_plugin)
+            by_key: dict[str, list[dict]] = {}
+            for tool in discovered:
+                by_key.setdefault(str(tool.get('capability_key') or ''), []).append({
+                    'name': tool.get('original_name'),
+                    'call_name': tool.get('name'),
+                    'input_schema': copy.deepcopy(
+                        self.runtime._mcp_schemas.get(str(tool.get('name') or ''), {}).get(
+                            'inputSchema', {'type': 'object', 'properties': {}}
+                        )
+                    ),
+                })
+            for item in result:
+                if item.get('kind') == 'mcp':
+                    item['tools'] = by_key.get(str(item.get('key') or ''), [])
+        return result
+
+    async def call_capability(
+        self, consumer_plugin: str, capability_key: str, arguments: dict | None = None,
+    ):
+        """Call an allowed capability by the key returned from discover_capabilities()."""
+        arguments = arguments if isinstance(arguments, dict) else {}
+        item = next((value for value in self.plugin_capabilities(
+            consumer_plugin=consumer_plugin,
+        ) if value.get('key') == str(capability_key or '') and value.get('online')), None)
+        if item is None:
+            raise AIServiceError('能力不存在、未开启共享或当前插件无权使用')
+        if item['kind'] == 'skill':
+            return {'ok': True, 'capability_key': item['key'], 'content': item.get('content', '')}
+        if item['kind'] == 'agent':
+            return await self.runtime._delegate_plugin_agent({
+                'capability_key': item['key'], 'task': str(arguments.get('task') or ''),
+            }, consumer_plugin)
+        if item['kind'] == 'tool':
+            handler = self.capability_handler(item['key'])
+            if handler is None:
+                return {'ok': False, 'error': '插件能力当前不在线'}
+            value = handler(item['id'], arguments)
+            return await value if asyncio.iscoroutine(value) else value
+        if item['kind'] == 'mcp':
+            await self.runtime.refresh_plugin_mcp_tools(consumer_plugin)
+            tool_name = str(arguments.get('tool') or '')
+            tool_arguments = arguments.get('arguments')
+            tool_arguments = tool_arguments if isinstance(tool_arguments, dict) else {}
+            for call_name, (capability, _server, original) in self.runtime._plugin_mcp_tools.get(
+                consumer_plugin, {}
+            ).items():
+                if capability.get('key') == item['key'] and original == tool_name:
+                    return await self.runtime.call_tool(
+                        call_name, tool_arguments, consumer_plugin=consumer_plugin,
+                    )
+            return {'ok': False, 'error': 'MCP 工具不存在或服务当前不可用'}
+        return {'ok': False, 'error': '不支持的能力类型'}
 
     def config(self, *, public: bool = False) -> dict:
         result = copy.deepcopy(self._config)
@@ -569,28 +747,60 @@ class AIService:
                 self._save_callback(self._config)
         return results
 
-    async def _request(self, provider: dict, payload: dict) -> dict:
+    async def _request(self, provider: dict, payload: dict, run_id: str = '') -> dict:
         headers = {'Content-Type': 'application/json'}
         if provider.get('api_key'):
             headers['Authorization'] = f"Bearer {provider['api_key']}"
         timeout = aiohttp.ClientTimeout(total=self._config['request_timeout'])
-        async with (
-            aiohttp.ClientSession(timeout=timeout) as session,
-            session.post(
-                provider['base_url'] + '/chat/completions', headers=headers, json=payload
-            ) as response,
-        ):
-            raw = await response.text()
-            if response.status < 200 or response.status >= 300:
-                raise AIServiceError(f'HTTP {response.status}: {raw[:300]}')
+        attempt_id = self.audit.attempt_start(
+            run_id, provider, str(payload.get('model') or ''), payload,
+        ) if run_id else ''
+        started = time.perf_counter()
         try:
-            return json.loads(raw)
+            async with (
+                aiohttp.ClientSession(timeout=timeout) as session,
+                session.post(
+                    provider['base_url'] + '/chat/completions', headers=headers, json=payload
+                ) as response,
+            ):
+                first_byte_ms = round((time.perf_counter() - started) * 1000)
+                raw = await response.text()
+                elapsed = round((time.perf_counter() - started) * 1000)
+                if response.status < 200 or response.status >= 300:
+                    if run_id:
+                        self.audit.attempt_finish(
+                            run_id, attempt_id, status='error', http_status=response.status,
+                            response=raw, error=f'HTTP {response.status}', ttfb_ms=first_byte_ms,
+                            response_headers=dict(response.headers),
+                        )
+                    raise AIServiceError(f'HTTP {response.status}: {raw[:300]}')
+        except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as error:
+            if run_id:
+                self.audit.attempt_finish(
+                    run_id, attempt_id, status='error', http_status=None, error=str(error),
+                )
+            raise
+        try:
+            data = json.loads(raw)
         except json.JSONDecodeError as error:
+            if run_id:
+                self.audit.attempt_finish(
+                    run_id, attempt_id, status='error', http_status=response.status,
+                    response=raw, error='invalid JSON', ttfb_ms=first_byte_ms,
+                    response_headers=dict(response.headers),
+                )
             raise AIServiceError('接口返回了无效 JSON') from error
+        if run_id:
+            self.audit.attempt_finish(
+                run_id, attempt_id, status='success', http_status=response.status,
+                response=data, usage=data.get('usage') or {}, ttfb_ms=first_byte_ms,
+                response_headers=dict(response.headers),
+            )
+        return data
 
     async def _stream_candidate(
         self, provider: dict, model: str, messages: list[dict],
-        system_prompt: str, temperature: float | None, max_tokens: int | None,
+        system_prompt: str, temperature: float | None, max_tokens: int | None, run_id: str = '',
     ) -> AsyncIterator[dict]:
         payload_messages = copy.deepcopy(messages)
         if system_prompt:
@@ -608,6 +818,8 @@ class AIService:
         timeout = aiohttp.ClientTimeout(total=self._config['request_timeout'])
 
         for attempt in range(2):
+            attempt_id = self.audit.attempt_start(run_id, provider, model, payload) if run_id else ''
+            request_started = time.perf_counter()
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     provider['base_url'] + '/chat/completions',
@@ -616,6 +828,13 @@ class AIService:
                 ) as response:
                     if response.status < 200 or response.status >= 300:
                         raw = await response.text()
+                        elapsed = round((time.perf_counter() - request_started) * 1000)
+                        if run_id:
+                            self.audit.attempt_finish(
+                                run_id, attempt_id, status='error', http_status=response.status,
+                                response=raw, error=f'HTTP {response.status}', ttfb_ms=elapsed,
+                                response_headers=dict(response.headers),
+                            )
                         if (
                             attempt == 0
                             and 'max_tokens' in raw.lower()
@@ -630,6 +849,7 @@ class AIService:
                     content_type = response.headers.get('Content-Type', '').lower()
                     if 'event-stream' not in content_type and 'ndjson' not in content_type:
                         raw = await response.text()
+                        elapsed = round((time.perf_counter() - request_started) * 1000)
                         try:
                             data = json.loads(raw)
                         except json.JSONDecodeError as error:
@@ -642,11 +862,19 @@ class AIService:
                             )
                         if content:
                             yield {'type': 'delta', 'text': str(content)}
+                        if run_id:
+                            self.audit.attempt_finish(
+                                run_id, attempt_id, status='success', http_status=response.status,
+                                response=data, usage=data.get('usage') or {}, ttfb_ms=elapsed,
+                                response_headers=dict(response.headers),
+                            )
                         yield {'type': 'done', 'usage': data.get('usage') or {}}
                         return
 
                     usage = {}
                     saw_delta = False
+                    response_text = []
+                    first_token_ms = None
                     async for raw_line in response.content:
                         line = raw_line.decode('utf-8', errors='replace').strip()
                         if not line or line.startswith(':'):
@@ -673,13 +901,22 @@ class AIService:
                                 if isinstance(part, dict)
                             )
                         if content:
+                            if first_token_ms is None:
+                                first_token_ms = round((time.perf_counter() - request_started) * 1000)
                             saw_delta = True
+                            response_text.append(str(content))
                             yield {'type': 'delta', 'text': str(content)}
                     if not saw_delta:
                         raise AIServiceError('stream response contained no text')
                     self._health[(provider['id'], model)] = {
                         'ok': True, 'error': '', 'checked_at': int(time.time()),
                     }
+                    if run_id:
+                        self.audit.attempt_finish(
+                            run_id, attempt_id, status='success', http_status=response.status,
+                            response={'text': ''.join(response_text)}, usage=usage,
+                            ttfb_ms=first_token_ms, response_headers=dict(response.headers),
+                        )
                     yield {'type': 'done', 'usage': usage}
                     return
 
@@ -702,6 +939,13 @@ class AIService:
         run_id = self.runtime.begin_run(session_id)
         error_text = ''
         started_output = False
+        final_text = []
+        final_usage = {}
+        self.audit.start(run_id, kind='stream', session_id=session_id, consumer_plugin='', request={
+            'messages': messages, 'system_prompt': system_prompt, 'runtime_prompt': runtime_prompt,
+            'provider_id': provider_id, 'model': model, 'temperature': temperature,
+            'max_tokens': max_tokens,
+        })
         try:
             candidates = self._candidates(provider_id, model)
             if not candidates:
@@ -719,27 +963,39 @@ class AIService:
                     async for event in self._stream_candidate(
                         provider, candidate_model, prepared_messages, combined_prompt,
                         temperature, max_tokens,
+                        run_id,
                     ):
                         event['run_id'] = run_id
                         if event.get('type') == 'delta':
                             started_output = True
+                            final_text.append(str(event.get('text') or ''))
+                        elif event.get('type') == 'done':
+                            final_usage = event.get('usage') or {}
                         yield event
                     return
                 except (AIServiceError, aiohttp.ClientError, TimeoutError) as error:
                     last_error = error
+                    self.audit.fail_running_attempt(run_id, str(error))
                     self._health[(provider['id'], candidate_model)] = {
                         'ok': False, 'error': str(error)[:160], 'checked_at': int(time.time()),
                     }
+                    self.audit.event(run_id, 'failover', {
+                        'provider_id': provider['id'], 'model': candidate_model, 'error': str(error),
+                    })
                     if started_output or not self._config['auto_switch'] or model:
                         raise
             raise last_error or AIServiceError('all AI providers failed')
         except asyncio.CancelledError:
             error_text = 'interrupted'
+            self.audit.fail_running_attempt(run_id, error_text)
             raise
         except Exception as error:
             error_text = str(error)
             raise
         finally:
+            self.audit.finish(
+                run_id, response={'text': ''.join(final_text)}, usage=final_usage, error=error_text,
+            )
             self.runtime.finish_run(run_id, error_text)
 
     async def complete(
@@ -765,6 +1021,13 @@ class AIService:
             raise AIServiceError('AI LLM 服务未启用')
         run_id = self.runtime.begin_run(session_id)
         error_text = ''
+        final_result = None
+        self.audit.start(run_id, kind='complete', session_id=session_id, consumer_plugin=consumer_plugin, request={
+            'messages': messages, 'system_prompt': system_prompt, 'runtime_prompt': runtime_prompt,
+            'provider_id': provider_id, 'model': model, 'temperature': temperature,
+            'max_tokens': max_tokens, 'tools': tools or [],
+            'enable_runtime_tools': enable_runtime_tools, 'runtime_capabilities': runtime_capabilities or [],
+        })
         try:
             candidates = self._candidates(provider_id, model)
             if not candidates:
@@ -781,20 +1044,39 @@ class AIService:
                 consumer_plugin=consumer_plugin,
                 capability_types=runtime_capabilities,
             ) if enable_runtime_tools else []
-            all_tools = list(tools or [])
+            caller_tools = list(tools or [])
+            caller_tool_names = {
+                str(item.get('function', {}).get('name') or '')
+                for item in caller_tools if isinstance(item, dict)
+            }
+            caller_tool_names.discard('')
+            all_tools = list(caller_tools)
             known = {item.get('function', {}).get('name') for item in all_tools}
             all_tools.extend(item for item in runtime_tools if item['function']['name'] not in known)
 
             async def combined_handler(name: str, arguments: dict):
-                internal = await self.runtime.call_tool(
-                    name, arguments, consumer_plugin=consumer_plugin,
-                )
-                if internal is not None:
-                    return internal
-                if tool_handler is None:
-                    return {'ok': False, 'error': '工具不可用'}
-                value = tool_handler(name, arguments)
-                return await value if asyncio.iscoroutine(value) else value
+                tool_id = self.audit.tool_start(run_id, name, arguments)
+                try:
+                    if tool_handler is not None and name in caller_tool_names:
+                        value = tool_handler(name, arguments)
+                        result = await value if asyncio.iscoroutine(value) else value
+                    else:
+                        result = await self.runtime.call_tool(
+                            name, arguments, consumer_plugin=consumer_plugin,
+                        )
+                        if result is None and tool_handler is None:
+                            result = {'ok': False, 'error': '工具不可用'}
+                        elif result is None:
+                            value = tool_handler(name, arguments)
+                            result = await value if asyncio.iscoroutine(value) else value
+                    self.audit.tool_finish(run_id, tool_id, result=result)
+                    return result
+                except Exception as error:
+                    self.audit.tool_finish(run_id, tool_id, error=str(error))
+                    raise
+                except asyncio.CancelledError:
+                    self.audit.tool_finish(run_id, tool_id, error='interrupted')
+                    raise
 
             last_error = None
             for provider, candidate_model in candidates:
@@ -803,29 +1085,40 @@ class AIService:
                         provider, candidate_model, prepared_messages, combined_prompt,
                         temperature, max_tokens, all_tools or None,
                         combined_handler if all_tools else None, max_tool_rounds,
+                        run_id,
                     )
                     result['run_id'] = run_id
+                    final_result = result
                     return result
                 except (AIServiceError, aiohttp.ClientError, TimeoutError) as error:
                     last_error = error
+                    self.audit.fail_running_attempt(run_id, str(error))
                     self._health[(provider['id'], candidate_model)] = {
                         'ok': False, 'error': str(error)[:160], 'checked_at': int(time.time()),
                     }
+                    self.audit.event(run_id, 'failover', {
+                        'provider_id': provider['id'], 'model': candidate_model, 'error': str(error),
+                    })
                     if not self._config['auto_switch'] or model:
                         raise
             raise last_error or AIServiceError('所有接口均不可用')
         except asyncio.CancelledError:
             error_text = 'interrupted'
+            self.audit.fail_running_attempt(run_id, error_text)
             raise
         except Exception as error:
             error_text = str(error)
             raise
         finally:
+            self.audit.finish(
+                run_id, response=final_result,
+                usage=(final_result or {}).get('usage') or {}, error=error_text,
+            )
             self.runtime.finish_run(run_id, error_text)
 
     async def _complete_candidate(
         self, provider, model, messages, system_prompt, temperature,
-        max_tokens, tools, tool_handler, max_tool_rounds,
+        max_tokens, tools, tool_handler, max_tool_rounds, run_id='',
     ) -> dict:
         payload_messages = copy.deepcopy(messages)
         if system_prompt:
@@ -842,11 +1135,11 @@ class AIService:
         rounds = self._config['max_tool_rounds'] if max_tool_rounds is None else max_tool_rounds
         for _round in range(max(1, rounds + 1)):
             try:
-                data = await self._request(provider, payload)
+                data = await self._request(provider, payload, run_id)
             except AIServiceError as error:
                 if 'max_tokens' in str(error).lower() and 'max_completion_tokens' not in payload:
                     payload['max_completion_tokens'] = payload.pop('max_tokens')
-                    data = await self._request(provider, payload)
+                    data = await self._request(provider, payload, run_id)
                 else:
                     raise
             try:
@@ -854,6 +1147,9 @@ class AIService:
             except (KeyError, IndexError, TypeError) as error:
                 raise AIServiceError('接口返回中没有 choices[0].message') from error
             tool_calls = message.get('tool_calls') or []
+            fallback_content = message.get('content')
+            if not tool_calls and isinstance(fallback_content, str):
+                tool_calls, fallback_content = _xml_tool_calls(fallback_content, tools)
             if not tool_calls:
                 content = message.get('content')
                 if isinstance(content, list):
@@ -875,7 +1171,7 @@ class AIService:
                 raise AIServiceError('模型请求了不可用工具或达到工具轮数上限')
             payload['messages'].append({
                 'role': 'assistant',
-                'content': message.get('content') or '',
+                'content': fallback_content or '',
                 'tool_calls': tool_calls,
             })
             for call in tool_calls[:8]:
