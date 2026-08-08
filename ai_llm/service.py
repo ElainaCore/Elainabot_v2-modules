@@ -46,6 +46,7 @@ DEFAULT_CONFIG = {
         'execution_timeout': 20,
     },
     'subagents': [],
+    'plugin_capabilities': [],
     'cron_jobs': [],
     'providers': [
         {
@@ -202,6 +203,37 @@ def normalize_config(value: dict | None) -> dict:
                 'enabled': bool(raw.get('enabled', True)),
             })
     result['subagents'] = subagents[:50]
+    capabilities = []
+    seen_capabilities = set()
+    for raw in result.get('plugin_capabilities', []) if isinstance(result.get('plugin_capabilities'), list) else []:
+        if not isinstance(raw, dict):
+            continue
+        source = str(raw.get('source_plugin') or '').strip()[:128]
+        kind = str(raw.get('kind') or '').strip().lower()
+        capability_id = str(raw.get('id') or '').strip()[:128]
+        if not source or kind not in {'skill', 'agent', 'mcp', 'tool'} or not capability_id:
+            continue
+        key = f'{source}:{kind}:{capability_id}'
+        if key in seen_capabilities:
+            continue
+        seen_capabilities.add(key)
+        allowed = raw.get('allowed_plugins', [])
+        capabilities.append({
+            'key': key,
+            'id': capability_id,
+            'kind': kind,
+            'source_plugin': source,
+            'name': str(raw.get('name') or capability_id).strip()[:100],
+            'description': str(raw.get('description') or '').strip()[:500],
+            'enabled': bool(raw.get('enabled', True)),
+            'shared': bool(raw.get('shared', False)),
+            'allowed_plugins': list(dict.fromkeys(
+                str(item).strip()[:128] for item in allowed if str(item).strip()
+            ))[:100] if isinstance(allowed, list) else [],
+            'content': str(raw.get('content') or '')[:30000],
+            'config': copy.deepcopy(raw.get('config')) if isinstance(raw.get('config'), dict) else {},
+        })
+    result['plugin_capabilities'] = capabilities[:500]
     cron_jobs = []
     for raw in result.get('cron_jobs', []) if isinstance(result.get('cron_jobs'), list) else []:
         if not isinstance(raw, dict):
@@ -229,11 +261,124 @@ class AIService:
         self._save_callback = save_callback
         self._lock = asyncio.Lock()
         self._health: dict[tuple[str, str], dict] = {}
+        self._capability_handlers: dict[str, ToolHandler] = {}
+        self._online_capabilities: set[str] = set()
         for provider in self._config.get('providers', []):
             for model, health in (provider.get('health') or {}).items():
                 if isinstance(health, dict):
                     self._health[(provider['id'], model)] = copy.deepcopy(health)
         self.runtime = AgentRuntime(self, data_dir or '.')
+
+    @staticmethod
+    def _capability_allowed(item: dict, consumer_plugin: str = '') -> bool:
+        consumer = str(consumer_plugin or '').strip()
+        if not item.get('enabled'):
+            return False
+        if not consumer:
+            return False
+        return (
+            consumer == item.get('source_plugin')
+            or bool(item.get('shared'))
+            or consumer in set(item.get('allowed_plugins') or [])
+        )
+
+    def plugin_capabilities(
+        self, *, consumer_plugin: str = '', kind: str = '', public: bool = False,
+    ) -> list[dict]:
+        result = []
+        for item in self._config.get('plugin_capabilities', []):
+            if kind and item.get('kind') != kind:
+                continue
+            if consumer_plugin and not self._capability_allowed(item, consumer_plugin):
+                continue
+            value = copy.deepcopy(item)
+            value['online'] = value['key'] in self._online_capabilities
+            if public and value['kind'] == 'mcp':
+                config = value.get('config', {})
+                headers = config.get('headers', {}) if isinstance(config, dict) else {}
+                if isinstance(headers, dict):
+                    config['headers_set'] = bool(headers)
+                    config['headers'] = {str(key): '********' for key in headers}
+            result.append(value)
+        return result
+
+    def register_plugin_capability(
+        self, source_plugin: str, kind: str, definition: dict, handler: ToolHandler | None = None,
+    ) -> dict:
+        source = str(source_plugin or '').strip()[:128]
+        capability_kind = str(kind or '').strip().lower()
+        capability_id = str((definition or {}).get('id') or '').strip()[:128]
+        if not source or capability_kind not in {'skill', 'agent', 'mcp', 'tool'} or not capability_id:
+            raise ValueError('插件能力必须提供合法的 source_plugin、kind 和 id')
+        key = f'{source}:{capability_kind}:{capability_id}'
+        current = next((
+            item for item in self._config.get('plugin_capabilities', []) if item.get('key') == key
+        ), None)
+        incoming = copy.deepcopy(definition or {})
+        incoming.update({'key': key, 'id': capability_id, 'kind': capability_kind, 'source_plugin': source})
+        if current is not None:
+            for field in ('enabled', 'shared', 'allowed_plugins', 'content', 'config'):
+                if field in current:
+                    incoming[field] = copy.deepcopy(current[field])
+            records = [
+                incoming if item.get('key') == key else item
+                for item in self._config.get('plugin_capabilities', [])
+            ]
+        else:
+            incoming.setdefault('enabled', True)
+            incoming.setdefault('shared', False)
+            incoming.setdefault('allowed_plugins', [])
+            records = [*self._config.get('plugin_capabilities', []), incoming]
+        merged = copy.deepcopy(self._config)
+        merged['plugin_capabilities'] = records
+        self._config = normalize_config(merged)
+        if handler is not None:
+            self._capability_handlers[key] = handler
+        self._online_capabilities.add(key)
+        self._save_callback(self._config)
+        return next(item for item in self.plugin_capabilities() if item['key'] == key)
+
+    def unregister_plugin_capabilities(self, source_plugin: str) -> None:
+        prefix = str(source_plugin or '').strip() + ':'
+        for key in [key for key in self._capability_handlers if key.startswith(prefix)]:
+            self._capability_handlers.pop(key, None)
+        self._online_capabilities = {
+            key for key in self._online_capabilities if not key.startswith(prefix)
+        }
+
+    async def save_plugin_capabilities(self, incoming: list[dict]) -> list[dict]:
+        async with self._lock:
+            updates = {
+                str(item.get('key') or ''): item for item in incoming if isinstance(item, dict)
+            }
+            records = []
+            for current in self._config.get('plugin_capabilities', []):
+                update = updates.get(current.get('key'), {})
+                value = copy.deepcopy(current)
+                for field in ('enabled', 'shared', 'allowed_plugins', 'content', 'config'):
+                    if field in update:
+                        value[field] = copy.deepcopy(update[field])
+                if value.get('kind') == 'mcp' and isinstance(value.get('config'), dict):
+                    config = value['config']
+                    previous = current.get('config', {}) if isinstance(current.get('config'), dict) else {}
+                    headers = config.get('headers', {})
+                    if (
+                        config.get('headers_set')
+                        and isinstance(headers, dict)
+                        and headers
+                        and all(item == '********' for item in headers.values())
+                    ):
+                        config['headers'] = copy.deepcopy(previous.get('headers', {}))
+                    config.pop('headers_set', None)
+                records.append(value)
+            merged = copy.deepcopy(self._config)
+            merged['plugin_capabilities'] = records
+            self._config = normalize_config(merged)
+            self._save_callback(self._config)
+            return self.plugin_capabilities(public=True)
+
+    def capability_handler(self, key: str):
+        return self._capability_handlers.get(str(key or ''))
 
     def config(self, *, public: bool = False) -> dict:
         result = copy.deepcopy(self._config)
@@ -254,6 +399,7 @@ class AIService:
                 server['headers_set'] = bool(headers)
                 server['headers'] = {key: '********' for key in headers}
             result['runtime_status'] = self.runtime.status()
+            result['plugin_capabilities'] = self.plugin_capabilities(public=True)
         return result
 
     async def save(self, incoming: dict) -> dict:
@@ -289,6 +435,10 @@ class AIService:
         target = provider_id or self._config['active_provider']
         return next((item for item in self._config['providers'] if item['id'] == target and item['enabled']), None)
 
+    def available(self) -> bool:
+        """Return whether the service has at least one enabled, usable model."""
+        return bool(self._config.get('enabled') and self._candidates())
+
     def _candidates(self, provider_id: str = '', model: str = '') -> list[tuple[dict, str]]:
         primary = self._provider(provider_id)
         if primary is None:
@@ -307,9 +457,13 @@ class AIService:
                 models = [
                     item for item in provider['model_priority']
                     if item not in provider.get('disabled_models', [])
-                ] or [provider['model']]
+                ]
             else:
-                models = [provider['model']]
+                models = (
+                    [provider['model']]
+                    if provider['model'] not in provider.get('disabled_models', [])
+                    else []
+                )
             result.extend((provider, candidate) for candidate in models if candidate)
         return result
 
@@ -604,6 +758,8 @@ class AIService:
         runtime_prompt: str = '',
         enable_runtime_tools: bool = True,
         allow_handoff: bool = True,
+        consumer_plugin: str = '',
+        runtime_capabilities: list[str] | None = None,
     ) -> dict:
         if not self._config['enabled']:
             raise AIServiceError('AI LLM 服务未启用')
@@ -620,13 +776,19 @@ class AIService:
             )
             prompts = [self._config.get('runtime_prompt', ''), system_prompt, runtime_prompt]
             combined_prompt = '\n\n'.join(item.strip() for item in prompts if str(item).strip())
-            runtime_tools = await self.runtime.tools(allow_handoff=allow_handoff) if enable_runtime_tools else []
+            runtime_tools = await self.runtime.tools(
+                allow_handoff=allow_handoff,
+                consumer_plugin=consumer_plugin,
+                capability_types=runtime_capabilities,
+            ) if enable_runtime_tools else []
             all_tools = list(tools or [])
             known = {item.get('function', {}).get('name') for item in all_tools}
             all_tools.extend(item for item in runtime_tools if item['function']['name'] not in known)
 
             async def combined_handler(name: str, arguments: dict):
-                internal = await self.runtime.call_tool(name, arguments)
+                internal = await self.runtime.call_tool(
+                    name, arguments, consumer_plugin=consumer_plugin,
+                )
                 if internal is not None:
                     return internal
                 if tool_handler is None:

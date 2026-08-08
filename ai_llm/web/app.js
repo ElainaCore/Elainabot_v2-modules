@@ -1,6 +1,6 @@
 import {
   $, api, loadConfig, renderCommon, renderTestModels, saveSection as saveConfigSection,
-  setState, state, streamApi, toast,
+  readPluginCapabilities, setState, state, streamApi, toast,
 } from './core.js';
 import { bindProviders, renderProviders } from './providers.js';
 
@@ -53,6 +53,14 @@ $('add-cron').onclick = () => addItem('cron_jobs', {id: 'cron-' + Date.now(), na
 $('refresh-mcp').onclick = async () => {
   try { await saveConfigSection('capabilities'); const data = await api('/mcp/refresh', {method: 'POST'}); await loadAll(); toast('已注册 ' + data.tools.length + ' 个 MCP 工具'); }
   catch (error) { toast(error.message, true); }
+};
+$('save-plugin-capabilities').onclick = async () => {
+  try {
+    const data = await api('/plugin-capabilities', {method: 'PUT', body: JSON.stringify({items: readPluginCapabilities()})});
+    setState({...state, plugin_capabilities: data.items || []});
+    renderAll();
+    toast('插件能力授权已保存');
+  } catch (error) { toast(error.message, true); }
 };
 $('test-provider').onchange = renderTestModels;
 $('run-test').onclick = async () => {

@@ -14,7 +14,15 @@ def get_service() -> AIService | None:
 
         app = get_app()
         manager = getattr(app, 'module_manager', None)
-        return manager.get('ai_llm') if manager else None
+        if manager is None:
+            return None
+        service = manager.get('ai_llm')
+        if service is not None:
+            return service
+        for item in manager.list_modules():
+            if str(item.get('display_name') or '').strip() == 'AI LLM 服务':
+                return manager.get(str(item.get('name') or ''))
+        return None
     except (AttributeError, RuntimeError):
         return None
 

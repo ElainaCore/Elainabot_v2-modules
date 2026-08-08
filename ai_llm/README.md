@@ -41,6 +41,45 @@ async def ask_ai(text: str) -> str:
 
 调用方还可传入 `session_id`、`runtime_prompt`、`enable_runtime_tools` 和 `allow_handoff`。中断运行使用 `service.runtime.interrupt(run_id_or_session_id)`。
 
+## 插件能力注入
+
+插件可以把 `skill`、`agent`、`mcp` 或 `tool` 注册到中央运行时。能力会记录来源插件，默认只允许来源插件自身使用；管理员可在 AI LLM 面板中改为共享给全部插件，或填写允许使用的插件 ID。
+
+```python
+service.register_plugin_capability('my_plugin', 'skill', {
+    'id': 'my-workflow',
+    'name': '我的工作流',
+    'description': '供插件 Agent 按需读取的操作规范。',
+    'content': '执行该任务时必须遵守的完整说明。',
+})
+
+service.register_plugin_capability('my_plugin', 'mcp', {
+    'id': 'my-mcp',
+    'name': '我的 MCP',
+    'description': '由插件提供的公网 HTTPS MCP 服务。',
+    'config': {
+        'endpoint': 'https://example.com/mcp',
+        'headers': {'Authorization': 'Bearer ...'},
+        'timeout': 20,
+    },
+})
+```
+
+插件卸载时调用 `service.unregister_plugin_capabilities('my_plugin')`。这会立即下线该插件注入的能力，同时保留管理员调整过的共享范围与内容，插件重新加载后会自动恢复。
+
+消费中央能力时必须传入插件身份和允许的能力类型：
+
+```python
+result = await service.complete(
+    messages,
+    consumer_plugin='my_plugin',
+    runtime_capabilities=['skill', 'agent', 'mcp', 'tool'],
+    enable_runtime_tools=True,
+)
+```
+
+未传 `consumer_plugin` 的调用不会获得任何插件注入能力。模块只接受公网 HTTPS MCP 地址，并拒绝回环、内网、链路本地和云元数据地址。
+
 ## 工具调用
 
 插件可以传入 OpenAI 格式的 `tools`，并提供异步 `tool_handler(name, arguments)`：

@@ -2,17 +2,33 @@ export const BASE = '/api/ext/ai-service';
 export const $ = id => document.getElementById(id);
 export let state = {};
 export let skills = [];
-const token = new URLSearchParams(location.search).get('token') || '';
-function requestUrl(path) {
-  const value = new URL(path.startsWith('http') ? path : BASE + path, location.origin);
-  if (token) value.searchParams.set('token', token);
-  return value.toString();
+const THEME_MAP = {'--bg':'--host-bg','--bg2':'--host-bg2','--bg3':'--host-bg3','--bg-float':'--host-float','--text':'--host-text','--text2':'--host-text2','--text3':'--host-text3','--border':'--host-border','--accent':'--host-accent','--accent-hover':'--host-accent-hover','--accent-light':'--host-accent-light','--accent-soft':'--host-accent-soft','--success':'--host-success','--danger':'--host-danger','--warning':'--host-warning','--info':'--host-info'};
+export function syncHostTheme() {
+  try {
+    if (window.parent === window) return;
+    const parentStyle = window.parent.getComputedStyle(window.parent.document.documentElement);
+    const root = document.documentElement;
+    Object.entries(THEME_MAP).forEach(([source, target]) => {
+      const value = parentStyle.getPropertyValue(source).trim();
+      if (value) root.style.setProperty(target, value);
+    });
+    root.style.colorScheme = parentStyle.colorScheme || 'normal';
+  } catch (_) {}
 }
+syncHostTheme();
+try {
+  if (window.parent !== window) {
+    new MutationObserver(syncHostTheme).observe(window.parent.document.documentElement, {
+      attributes: true,
+      attributeFilter: ['style', 'class'],
+    });
+  }
+} catch (_) {}
+function requestUrl(path) { return new URL(path.startsWith('http') ? path : BASE + path, location.origin).toString(); }
 export async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set('Content-Type', 'application/json');
-  if (token) headers.set('Authorization', 'Bearer ' + token);
-  const response = await fetch(requestUrl(path), {...options, headers});
+  const response = await fetch(requestUrl(path), {...options, headers, credentials: 'same-origin'});
   const raw = await response.text();
   let payload = {};
   try { payload = raw ? JSON.parse(raw) : {}; } catch (_) { payload = {error: raw}; }
@@ -21,8 +37,7 @@ export async function api(path, options = {}) {
 }
 export async function streamApi(path, body, onEvent) {
   const headers = {'Content-Type': 'application/json', Accept: 'text/event-stream'};
-  if (token) headers.Authorization = 'Bearer ' + token;
-  const response = await fetch(requestUrl(path), {method: 'POST', headers, body: JSON.stringify(body)});
+  const response = await fetch(requestUrl(path), {method: 'POST', headers, credentials: 'same-origin', body: JSON.stringify(body)});
   if (!response.ok) throw new Error((await response.text()) || ('HTTP ' + response.status));
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -70,6 +85,22 @@ export function agentTemplate(item) {
 export function mcpTemplate(item) {
   const headers = JSON.stringify(item.headers || {}, null, 2);
   return '<article class="item" data-id="' + esc(item.id) + '"><div class="item-head"><strong>' + esc(item.name || 'MCP Server') + '</strong><button class="btn danger remove-item" type="button">删除</button></div><div class="item-body"><div class="grid"><div class="field"><label>ID</label>' + field('id', item.id) + '</div><div class="field"><label>名称</label>' + field('name', item.name) + '</div><div class="field"><label>Streamable HTTP 地址</label>' + field('endpoint', item.endpoint || '') + '</div><div class="field"><label>超时（秒）</label>' + field('timeout', item.timeout || 20, 'number') + '</div><div class="field"><label>请求头（JSON）</label><textarea data-key="headers" data-headers-set="' + (item.headers_set ? '1' : '0') + '">' + esc(headers) + '</textarea></div></div><label class="switch compact" style="margin-top:12px"><span><b>启用服务</b></span><input data-key="enabled" type="checkbox" ' + (item.enabled ? 'checked' : '') + '></label></div></article>';
+}
+export function capabilityTemplate(item) {
+  const allowed = (item.allowed_plugins || []).join('\n');
+  const config = JSON.stringify(item.config || {}, null, 2);
+  return '<article class="item capability-item" data-key="' + esc(item.key) + '"><div class="item-head"><div><strong>' + esc(item.name || item.id) + '</strong><div class="capability-meta">' + esc(item.kind) + ' · 来源 ' + esc(item.source_plugin) + (item.online ? ' · 在线' : ' · 离线') + '</div></div></div><div class="item-body"><div class="switches"><label class="switch compact"><span><b>启用能力</b></span><input data-key="enabled" type="checkbox" ' + (item.enabled ? 'checked' : '') + '></label><label class="switch compact"><span><b>允许全部插件使用</b><small>关闭时仅来源插件及允许列表可用</small></span><input data-key="shared" type="checkbox" ' + (item.shared ? 'checked' : '') + '></label></div><div class="grid" style="margin-top:12px"><div class="field"><label>允许使用的其他插件（每行一个）</label><textarea data-key="allowed_plugins">' + esc(allowed) + '</textarea></div><div class="field"><label>能力配置（JSON）</label><textarea data-key="config">' + esc(config) + '</textarea></div></div><div class="field" style="margin-top:12px"><label>能力内容 / Prompt / Skill 指令</label><textarea data-key="content">' + esc(item.content || '') + '</textarea></div></div></article>';
+}
+export function readPluginCapabilities() {
+  return [...document.querySelectorAll('#plugin-capability-list .capability-item')].map(card => {
+    const value = {key: card.dataset.key};
+    value.enabled = card.querySelector('[data-key="enabled"]').checked;
+    value.shared = card.querySelector('[data-key="shared"]').checked;
+    value.allowed_plugins = card.querySelector('[data-key="allowed_plugins"]').value.split(/[,\n]/).map(item => item.trim()).filter(Boolean);
+    value.content = card.querySelector('[data-key="content"]').value;
+    try { value.config = JSON.parse(card.querySelector('[data-key="config"]').value || '{}'); } catch (_) { throw new Error('插件能力配置必须是合法 JSON'); }
+    return value;
+  });
 }
 export function cronTemplate(item) {
   return '<article class="item" data-id="' + esc(item.id) + '"><div class="item-head"><strong>' + esc(item.name || '计划任务') + '</strong><button class="btn danger remove-item" type="button">删除</button></div><div class="item-body"><div class="grid"><div class="field"><label>ID</label>' + field('id', item.id) + '</div><div class="field"><label>名称</label>' + field('name', item.name) + '</div><div class="field"><label>Cron（五段）</label>' + field('cron', item.cron || '') + '</div><div class="field"><label>间隔秒数</label>' + field('interval_seconds', item.interval_seconds || 0, 'number') + '</div><div class="field"><label>接口</label><select data-key="provider_id">' + providerOptions(item.provider_id, true) + '</select></div><div class="field"><label>模型</label>' + field('model', item.model || '') + '</div></div><div class="field" style="margin-top:12px"><label>任务 Prompt</label><textarea data-key="prompt">' + esc(item.prompt || '') + '</textarea></div><label class="switch compact" style="margin-top:12px"><span><b>启用任务</b></span><input data-key="enabled" type="checkbox" ' + (item.enabled ? 'checked' : '') + '></label></div></article>';
@@ -122,6 +153,7 @@ export function renderCommon() {
   $('m-runs').textContent = state.runtime_status?.running ?? 0;
   $('m-tools').textContent = state.runtime_status?.mcp_tools ?? 0;
   $('skill-list').innerHTML = skills.length ? skills.map(item => '<label class="skill"><input type="checkbox" data-skill-id="' + esc(item.id) + '" ' + ((state.skills?.enabled_ids || []).includes(item.id) ? 'checked' : '') + '><span><b>' + esc(item.name) + '</b><small>' + esc(item.description) + '</small></span></label>').join('') : '<div class="empty">请将 Skill 放入 data/skills/&lt;id&gt;/SKILL.md</div>';
+  $('plugin-capability-list').innerHTML = (state.plugin_capabilities || []).map(capabilityTemplate).join('') || '<div class="empty">尚无插件注入 Agent、Skill、MCP 或工具能力</div>';
   $('test-provider').innerHTML = providerOptions(state.active_provider);
   $('test-provider').value = state.active_provider || '';
   renderTestModels();
