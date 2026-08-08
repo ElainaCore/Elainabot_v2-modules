@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>AI LLM 服务</title>
+  <link rel="stylesheet" href="/api/ext/ai-service/assets/panel.css">
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="sidebar">
+      <div class="brand"><div class="logo">LLM</div><div><strong>AI LLM 服务</strong><small>Providers &amp; Agent Runtime</small></div></div>
+      <nav class="nav" aria-label="AI LLM 服务导航">
+        <button class="active" data-page="overview"><i>01</i><span>概览</span></button>
+        <button data-page="providers"><i>02</i><span>模型服务</span></button>
+        <button data-page="agents"><i>03</i><span>子代理</span></button>
+        <button data-page="capabilities"><i>04</i><span>能力与工具</span></button>
+        <button data-page="cron"><i>05</i><span>Cron Job</span></button>
+        <button data-page="test"><i>06</i><span>流式测试</span></button>
+      </nav>
+      <div class="service-state"><span class="pulse"></span><span>服务运行中</span></div>
+    </aside>
+    <main class="workspace">
+      <header class="topbar">
+        <div class="heading"><button class="icon-btn" id="sidebar-toggle" type="button" title="收起侧边栏" aria-label="收起侧边栏">≡</button><div><h1 id="page-title">概览</h1><p>统一接口、模型优先级与 Agent 运行时</p></div></div>
+        <div class="actions"><button class="btn" id="reload" type="button">刷新</button></div>
+      </header>
+      <div class="content">
+        <section class="page active" id="page-overview">
+          <div class="metrics"><div class="metric primary"><span>已启用接口</span><b id="m-providers">0</b></div><div class="metric success"><span>可用模型</span><b id="m-models">0</b></div><div class="metric warning"><span>运行中任务</span><b id="m-runs">0</b></div><div class="metric"><span>MCP 工具</span><b id="m-tools">0</b></div></div>
+          <div class="panel"><div class="panel-head"><div><h2>全局运行策略</h2><p>统一控制模型调用与故障切换</p></div><button class="btn primary save-section" data-section="overview">保存概览</button></div><div class="panel-body"><div class="switches"><label class="switch"><span><b>启用 LLM 服务</b><small>允许插件调用统一服务</small></span><input type="checkbox" id="enabled"></label><label class="switch"><span><b>启用 Agent</b><small>允许工具调用和运行时能力</small></span><input type="checkbox" id="agent_enabled"></label><label class="switch"><span><b>自动故障切换</b><small>按接口和模型优先级重试</small></span><input type="checkbox" id="auto_switch"></label><label class="switch"><span><b>自动获取模型</b><small>启动时同步接口模型列表</small></span><input type="checkbox" id="auto_fetch_models"></label></div><div class="grid" style="margin-top:12px"><div class="field"><label>温度</label><input id="temperature" type="number" min="0" max="2" step="0.1"></div><div class="field"><label>最大输出 Token</label><input id="max_tokens" type="number" min="1" max="131072"></div><div class="field"><label>工具最大轮次</label><input id="max_tool_rounds" type="number" min="1" max="20"></div><div class="field"><label>请求超时（秒）</label><input id="request_timeout" type="number" min="5" max="600"></div></div></div></div>
+        </section>
+        <section class="page" id="page-providers"><div class="panel"><div class="panel-head"><div><h2>模型服务</h2><p>每个接口独立保存；拖动模型卡片调整优先级</p></div><button class="btn primary" id="add-provider" type="button">添加接口</button></div><div class="panel-body"><div class="provider-list" id="provider-list"></div></div></div></section>
+        <section class="page" id="page-agents"><div class="panel"><div class="panel-head"><div><h2>子代理</h2><p>为复杂任务配置专用 Prompt、接口和模型</p></div><div class="actions"><button class="btn save-section" data-section="agents">保存子代理</button><button class="btn primary" id="add-agent" type="button">添加子代理</button></div></div><div class="panel-body"><div class="item-list" id="agent-list"></div></div></div></section>
+        <section class="page" id="page-capabilities">
+          <div class="panel"><div class="panel-head"><div><h2>运行时 Prompt</h2><p>动态注入到每次 LLM 请求最前方</p></div><button class="btn primary save-section" data-section="capabilities">保存能力设置</button></div><div class="panel-body"><div class="field"><textarea id="runtime_prompt" placeholder="输入全局运行时约束"></textarea></div></div></div>
+          <div class="panel"><div class="panel-head"><div><h2>上下文管理</h2><p>按轮次和估算 Token 自动压缩</p></div></div><div class="panel-body"><div class="grid"><div class="field"><label>最大上下文 Token</label><input id="context_max_tokens" type="number" min="0" max="2000000"></div><div class="field"><label>最大对话轮次</label><input id="context_max_turns" type="number" min="0" max="1000"></div><div class="field"><label>精确保留比例</label><input id="context_keep_ratio" type="number" min="0.1" max="0.8" step="0.05"></div></div><label class="switch compact" style="margin-top:12px"><span><b>自动上下文压缩</b><small>超限后保留最近内容</small></span><input type="checkbox" id="context_compress"></label></div></div>
+          <div class="panel"><div class="panel-head"><div><h2>Skills</h2><p>仅在模型请求时读取完整 SKILL.md</p></div><label class="switch compact"><span><b>启用</b></span><input type="checkbox" id="skills_enabled"></label></div><div class="panel-body"><div class="skill-list" id="skill-list"></div></div></div>
+          <div class="panel"><div class="panel-head"><div><h2>MCP Servers</h2><p>HTTPS Streamable HTTP，工具自动注册到 Agent</p></div><div class="actions"><button class="btn" id="refresh-mcp" type="button">连接测试</button><button class="btn primary" id="add-mcp" type="button">添加服务</button></div></div><div class="panel-body"><label class="switch compact" style="margin-bottom:12px"><span><b>启用 MCP</b></span><input type="checkbox" id="mcp_enabled"></label><div class="item-list" id="mcp-list"></div></div></div>
+          <div class="panel"><div class="panel-head"><div><h2>Agent 沙箱</h2><p>代码只发送至隔离执行服务，不在主机执行</p></div></div><div class="panel-body"><label class="switch compact" style="margin-bottom:12px"><span><b>启用远程沙箱</b><small>需要兼容 /execute API</small></span><input type="checkbox" id="sandbox_enabled"></label><div class="grid"><div class="field"><label>沙箱 HTTPS 地址</label><input id="sandbox_endpoint" placeholder="https://sandbox.example.com"></div><div class="field"><label>访问令牌</label><input id="sandbox_token" type="password"></div><div class="field"><label>执行超时（秒）</label><input id="sandbox_exec_timeout" type="number" min="1" max="60"></div></div></div></div>
+        </section>
+        <section class="page" id="page-cron"><div class="panel"><div class="panel-head"><div><h2>Cron Job</h2><p>运行结果通过 ai_cron_result Hook 广播</p></div><div class="actions"><button class="btn save-section" data-section="cron">保存任务</button><button class="btn primary" id="add-cron" type="button">添加任务</button></div></div><div class="panel-body"><div class="item-list" id="cron-list"></div></div></div></section>
+        <section class="page" id="page-test"><div class="panel"><div class="panel-head"><div><h2>流式接口测试</h2><p>上游 SSE 分片会立即显示，不等待完整响应</p></div></div><div class="panel-body"><div class="grid"><div class="field"><label>接口</label><select id="test-provider"></select></div><div class="field"><label>模型</label><select id="test-model"></select></div><div class="field"><label>临时运行时 Prompt</label><input id="test-runtime-prompt"></div></div><div class="field" style="margin-top:12px"><label>消息</label><textarea id="test-message">你好，请简短说明当前模型与可用能力。</textarea></div><div class="actions" style="margin-top:12px"><button class="btn primary" id="run-test" type="button">开始流式测试</button><button class="btn danger" id="interrupt-test" type="button">中断</button></div><pre class="result" id="test-result">等待运行</pre></div></div></section>
+      </div>
+    </main>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script type="module" src="/api/ext/ai-service/assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,458 @@
+"""Agent runtime capabilities for the shared AI service."""
+from __future__ import annotations
+
+import asyncio
+import copy
+import ipaddress
+import json
+import os
+import re
+import socket
+import time
+import uuid
+from urllib.parse import urlsplit
+
+import aiohttp
+
+_SKILL_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
+_TOOL_NAME = re.compile(r'[^A-Za-z0-9_-]+')
+_IP_TEXT = re.compile(r'(?<![\w:])(?:\d{1,3}\.){3}\d{1,3}(?![\w:])')
+
+
+class RuntimeCapabilityError(RuntimeError):
+    pass
+
+
+class _PublicResolver(aiohttp.abc.AbstractResolver):
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        rows = await asyncio.get_running_loop().getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, family=family
+        )
+        result = []
+        for family_value, _, proto, _, sockaddr in rows:
+            address = ipaddress.ip_address(sockaddr[0].split('%', 1)[0])
+            if not address.is_global:
+                raise OSError('目标解析到非公网地址')
+            result.append({
+                'hostname': host,
+                'host': str(address),
+                'port': port,
+                'family': family_value,
+                'proto': proto,
+                'flags': socket.AI_NUMERICHOST,
+            })
+        if not result:
+            raise OSError('目标域名无法解析')
+        return result
+
+    async def close(self):
+        return None
+
+
+def _public_url(value: str) -> str:
+    parsed = urlsplit(str(value or '').strip())
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+        raise RuntimeCapabilityError('仅允许无登录凭据的公网 HTTPS 地址')
+    host = parsed.hostname.casefold().rstrip('.')
+    if host == 'localhost' or host.endswith(('.local', '.internal', '.localhost')):
+        raise RuntimeCapabilityError('禁止访问本机或内网地址')
+    try:
+        if not ipaddress.ip_address(host).is_global:
+            raise RuntimeCapabilityError('禁止访问本机或内网地址')
+    except ValueError:
+        pass
+    return parsed.geturl().rstrip('/')
+
+
+def _redact(value) -> str:
+    return _IP_TEXT.sub('[IP hidden]', str(value or ''))
+
+
+class AgentRuntime:
+    def __init__(self, service, data_dir: str):
+        self.service = service
+        self.data_dir = os.path.abspath(data_dir)
+        self.skills_dir = os.path.join(self.data_dir, 'skills')
+        os.makedirs(self.skills_dir, exist_ok=True)
+        self._runs: dict[str, dict] = {}
+        self._session_runs: dict[str, str] = {}
+        self._mcp_sessions: dict[str, str] = {}
+        self._mcp_tools: dict[str, tuple[dict, str]] = {}
+        self._mcp_schemas: dict[str, dict] = {}
+        self._mcp_errors: dict[str, str] = {}
+        self._cron_task: asyncio.Task | None = None
+        self._cron_seen: dict[str, float] = {}
+        self._emit = None
+
+    def status(self) -> dict:
+        running = sum(1 for item in self._runs.values() if item['status'] == 'running')
+        runs = []
+        for item in list(self._runs.values())[-30:]:
+            runs.append({key: copy.deepcopy(value) for key, value in item.items() if key != 'task'})
+        return {
+            'running': running,
+            'runs': runs,
+            'skills': self.skills(),
+            'mcp_tools': len(self._mcp_tools),
+            'mcp_errors': copy.deepcopy(self._mcp_errors),
+            'cron_active': bool(self._cron_task and not self._cron_task.done()),
+        }
+
+    def skills(self) -> list[dict]:
+        result = []
+        if not os.path.isdir(self.skills_dir):
+            return result
+        for skill_id in sorted(os.listdir(self.skills_dir)):
+            if not _SKILL_ID.fullmatch(skill_id):
+                continue
+            path = os.path.join(self.skills_dir, skill_id, 'SKILL.md')
+            if not os.path.isfile(path):
+                continue
+            name, description = skill_id, 'Agent Skill'
+            try:
+                with open(path, encoding='utf-8') as file:
+                    head = file.read(8192)
+                if head.startswith('---'):
+                    end = head.find('\n---', 3)
+                    for line in head[3:end if end >= 0 else 3].splitlines():
+                        key, separator, value = line.partition(':')
+                        if separator and key.strip() == 'name':
+                            name = value.strip().strip('"\'') or name
+                        if separator and key.strip() == 'description':
+                            description = value.strip().strip('"\'') or description
+            except OSError:
+                continue
+            result.append({'id': skill_id, 'name': name, 'description': description})
+        return result
+
+    def load_skill(self, skill_id: str) -> dict:
+        enabled = set(self.service.config().get('skills', {}).get('enabled_ids', []))
+        skill_id = str(skill_id or '').strip()
+        if not _SKILL_ID.fullmatch(skill_id) or skill_id not in enabled:
+            return {'ok': False, 'error': 'Skill 不存在或未启用'}
+        path = os.path.abspath(os.path.join(self.skills_dir, skill_id, 'SKILL.md'))
+        if not path.startswith(self.skills_dir + os.sep) or not os.path.isfile(path):
+            return {'ok': False, 'error': 'Skill 文件不存在'}
+        try:
+            with open(path, encoding='utf-8') as file:
+                return {'ok': True, 'skill_id': skill_id, 'content': file.read(30000)}
+        except OSError as error:
+            return {'ok': False, 'error': _redact(error)}
+
+    def prepare_context(self, messages: list[dict]) -> list[dict]:
+        settings = self.service.config().get('context', {})
+        result = copy.deepcopy(messages)
+        max_turns = int(settings.get('max_turns', 30))
+        if max_turns > 0:
+            user_indexes = [index for index, item in enumerate(result) if item.get('role') == 'user']
+            if len(user_indexes) > max_turns:
+                result = result[user_indexes[-max_turns]:]
+        max_tokens = int(settings.get('max_tokens', 65536))
+        estimate = sum(len(json.dumps(item, ensure_ascii=False, default=str)) for item in result) // 3
+        if max_tokens <= 0 or estimate <= max_tokens:
+            return result
+        keep_ratio = min(0.8, max(0.1, float(settings.get('keep_recent_ratio', 0.25))))
+        budget = max(1, int(max_tokens * keep_ratio)) * 3
+        recent, size = [], 0
+        for item in reversed(result):
+            item_size = len(json.dumps(item, ensure_ascii=False, default=str))
+            if len(recent) >= 2 and size + item_size > budget:
+                break
+            recent.append(item)
+            size += item_size
+        omitted = max(0, len(result) - len(recent))
+        summary = {
+            'role': 'system',
+            'content': f'[Context compressed: {omitted} older messages were removed.]',
+        }
+        return [summary, *reversed(recent)]
+
+    async def tools(self, *, allow_handoff: bool = True) -> list[dict]:
+        config = self.service.config()
+        result = []
+        skills_config = config.get('skills', {})
+        enabled_skills = set(skills_config.get('enabled_ids', []))
+        catalog = [item for item in self.skills() if item['id'] in enabled_skills]
+        if skills_config.get('enabled') and catalog:
+            result.append({
+                'type': 'function',
+                'function': {
+                    'name': 'load_skill',
+                    'description': '按需读取一个已启用 Skill 的完整操作说明。',
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {'skill_id': {'type': 'string', 'enum': [item['id'] for item in catalog]}},
+                        'required': ['skill_id'],
+                    },
+                },
+            })
+        agents = [item for item in config.get('subagents', []) if item.get('enabled')]
+        if allow_handoff and config.get('agent_enabled') and agents:
+            result.append({
+                'type': 'function',
+                'function': {
+                    'name': 'delegate_to_agent',
+                    'description': '把明确、独立的子任务交给最合适的子代理执行。',
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {
+                            'agent_id': {'type': 'string', 'enum': [item['id'] for item in agents]},
+                            'task': {'type': 'string'},
+                        },
+                        'required': ['agent_id', 'task'],
+                    },
+                },
+            })
+        sandbox = config.get('sandbox', {})
+        if sandbox.get('enabled') and sandbox.get('endpoint'):
+            result.append({
+                'type': 'function',
+                'function': {
+                    'name': 'sandbox_execute',
+                    'description': '在管理员配置的隔离沙箱中运行代码。',
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {
+                            'language': {'type': 'string', 'enum': ['python', 'javascript', 'shell']},
+                            'code': {'type': 'string'},
+                        },
+                        'required': ['language', 'code'],
+                    },
+                },
+            })
+        if config.get('mcp', {}).get('enabled'):
+            await self.refresh_mcp_tools()
+            for name, (server, original) in self._mcp_tools.items():
+                schema = copy.deepcopy(self._mcp_schemas.get(name, {}))
+                result.append({
+                    'type': 'function',
+                    'function': {
+                        'name': name,
+                        'description': str(schema.get('description') or f'MCP tool {original}'),
+                        'parameters': schema.get('inputSchema') or {'type': 'object', 'properties': {}},
+                    },
+                })
+        return result
+
+    async def call_tool(self, name: str, arguments: dict) -> dict | None:
+        if name == 'load_skill':
+            return self.load_skill(str(arguments.get('skill_id') or ''))
+        if name == 'delegate_to_agent':
+            return await self._delegate(arguments)
+        if name == 'sandbox_execute':
+            return await self._sandbox(arguments)
+        if name in self._mcp_tools:
+            server, original = self._mcp_tools[name]
+            payload = await self._mcp_rpc(server, 'tools/call', {
+                'name': original, 'arguments': arguments,
+            })
+            return {'ok': True, 'result': payload.get('result', payload)}
+        return None
+
+    async def _delegate(self, arguments: dict) -> dict:
+        config = self.service.config()
+        agent_id = str(arguments.get('agent_id') or '')
+        agent = next((item for item in config.get('subagents', []) if item.get('enabled') and item.get('id') == agent_id), None)
+        if agent is None:
+            return {'ok': False, 'error': '子代理不存在或未启用'}
+        result = await self.service.complete(
+            [{'role': 'user', 'content': str(arguments.get('task') or '')[:12000]}],
+            system_prompt=str(agent.get('system_prompt') or ''),
+            provider_id=str(agent.get('provider_id') or ''),
+            model=str(agent.get('model') or ''),
+            enable_runtime_tools=True,
+            allow_handoff=False,
+        )
+        return {'ok': True, 'agent_id': agent_id, 'text': result['text']}
+
+    async def _sandbox(self, arguments: dict) -> dict:
+        config = self.service.config().get('sandbox', {})
+        endpoint = _public_url(str(config.get('endpoint') or ''))
+        headers = {'Content-Type': 'application/json'}
+        if config.get('token'):
+            headers['Authorization'] = f"Bearer {config['token']}"
+        connector = aiohttp.TCPConnector(resolver=_PublicResolver(), ttl_dns_cache=0)
+        timeout = aiohttp.ClientTimeout(total=min(120, max(5, int(config.get('timeout', 30)))))
+        body = {
+            'language': str(arguments.get('language') or ''),
+            'code': str(arguments.get('code') or '')[:50000],
+            'timeout': min(60, max(1, int(config.get('execution_timeout', 20)))),
+        }
+        try:
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.post(endpoint + '/execute', headers=headers, json=body) as response:
+                    raw = await response.text()
+                    if response.status < 200 or response.status >= 300:
+                        raise RuntimeCapabilityError(f'沙箱返回 HTTP {response.status}')
+            return {'ok': True, 'result': json.loads(raw)}
+        except (aiohttp.ClientError, OSError, ValueError, json.JSONDecodeError) as error:
+            return {'ok': False, 'error': _redact(error)}
+
+    async def refresh_mcp_tools(self) -> list[dict]:
+        self._mcp_tools.clear()
+        self._mcp_schemas.clear()
+        self._mcp_errors.clear()
+        servers = self.service.config().get('mcp', {}).get('servers', [])
+        for server in servers:
+            if not server.get('enabled') or not server.get('endpoint'):
+                continue
+            try:
+                payload = await self._mcp_rpc(server, 'tools/list', {})
+                tools = payload.get('result', {}).get('tools', [])
+                for item in tools:
+                    original = str(item.get('name') or '')
+                    if not original:
+                        continue
+                    safe = _TOOL_NAME.sub('_', f"mcp_{server['id']}_{original}")[:64]
+                    self._mcp_tools[safe] = (server, original)
+                    self._mcp_schemas[safe] = item
+            except Exception as error:  # noqa: BLE001
+                self._mcp_errors[str(server.get('id') or '')] = _redact(error)[:160]
+        return [
+            {'name': name, 'server_id': server.get('id'), 'original_name': original}
+            for name, (server, original) in self._mcp_tools.items()
+        ]
+
+    async def _mcp_rpc(self, server: dict, method: str, params: dict) -> dict:
+        endpoint = _public_url(str(server.get('endpoint') or ''))
+        headers = {'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'}
+        for key, value in (server.get('headers') or {}).items():
+            if re.fullmatch(r'[A-Za-z0-9-]{1,64}', str(key)):
+                headers[str(key)] = str(value)
+        session_id = self._mcp_sessions.get(str(server.get('id') or ''))
+        if session_id:
+            headers['Mcp-Session-Id'] = session_id
+        timeout = aiohttp.ClientTimeout(total=min(60, max(5, int(server.get('timeout', 20)))))
+
+        async def request(payload):
+            connector = aiohttp.TCPConnector(resolver=_PublicResolver(), ttl_dns_cache=0)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.post(endpoint, headers=headers, json=payload) as response:
+                    raw = await response.text()
+                    if response.status < 200 or response.status >= 300:
+                        raise RuntimeCapabilityError(f'MCP 返回 HTTP {response.status}')
+                    new_session = response.headers.get('Mcp-Session-Id')
+                    if new_session:
+                        self._mcp_sessions[str(server.get('id') or '')] = new_session
+                    if 'text/event-stream' in response.headers.get('Content-Type', ''):
+                        rows = [line[5:].strip() for line in raw.splitlines() if line.startswith('data:')]
+                        raw = rows[-1] if rows else '{}'
+                    return json.loads(raw or '{}')
+
+        if not session_id:
+            await request({
+                'jsonrpc': '2.0', 'id': uuid.uuid4().hex,
+                'method': 'initialize',
+                'params': {
+                    'protocolVersion': '2025-03-26',
+                    'capabilities': {},
+                    'clientInfo': {'name': 'Elaina AI', 'version': '2.0'},
+                },
+            })
+            session_id = self._mcp_sessions.get(str(server.get('id') or ''))
+            if session_id:
+                headers['Mcp-Session-Id'] = session_id
+            await request({
+                'jsonrpc': '2.0', 'method': 'notifications/initialized', 'params': {},
+            })
+        return await request({
+            'jsonrpc': '2.0', 'id': uuid.uuid4().hex,
+            'method': method, 'params': params,
+        })
+
+    def begin_run(self, session_id: str = '') -> str:
+        run_id = uuid.uuid4().hex
+        self._runs[run_id] = {
+            'id': run_id, 'session_id': session_id, 'status': 'running',
+            'started_at': int(time.time()), 'finished_at': 0, 'error': '',
+        }
+        if session_id:
+            old = self._session_runs.get(session_id)
+            if old and old in self._runs and self._runs[old]['status'] == 'running':
+                self.interrupt(old)
+            self._session_runs[session_id] = run_id
+        self._runs[run_id]['task'] = asyncio.current_task()
+        return run_id
+
+    def finish_run(self, run_id: str, error: str = '') -> None:
+        item = self._runs.get(run_id)
+        if item:
+            if item.get('status') != 'interrupted':
+                item['status'] = 'failed' if error else 'completed'
+            item['error'] = _redact(error)[:300]
+            item['finished_at'] = int(time.time())
+            item.pop('task', None)
+        if len(self._runs) > 100:
+            for key in list(self._runs)[:-100]:
+                self._runs.pop(key, None)
+
+    def interrupt(self, target: str) -> bool:
+        run_id = self._session_runs.get(target, target)
+        item = self._runs.get(run_id)
+        task = item.get('task') if item else None
+        if not task or task.done():
+            return False
+        item['status'] = 'interrupted'
+        item['finished_at'] = int(time.time())
+        task.cancel()
+        return True
+
+    async def start(self, emit=None) -> None:
+        self._emit = emit
+        if self._cron_task is None or self._cron_task.done():
+            self._cron_task = asyncio.create_task(self._cron_loop())
+
+    async def stop(self) -> None:
+        if self._cron_task and not self._cron_task.done():
+            self._cron_task.cancel()
+            try:
+                await self._cron_task
+            except asyncio.CancelledError:
+                pass
+        for item in self._runs.values():
+            task = item.get('task')
+            if task and not task.done():
+                task.cancel()
+
+    async def _cron_loop(self) -> None:
+        while True:
+            await asyncio.sleep(15)
+            now = time.time()
+            minute = time.localtime(now)
+            for job in self.service.config().get('cron_jobs', []):
+                if not job.get('enabled') or not job.get('prompt'):
+                    continue
+                job_id = str(job.get('id') or '')
+                due = False
+                interval = int(job.get('interval_seconds') or 0)
+                if interval > 0:
+                    due = now - self._cron_seen.get(job_id, 0) >= max(60, interval)
+                elif job.get('cron'):
+                    fields = str(job['cron']).split()
+                    if len(fields) == 5:
+                        values = [minute.tm_min, minute.tm_hour, minute.tm_mday, minute.tm_mon, minute.tm_wday]
+                        due = all(field == '*' or str(value) in field.split(',') for field, value in zip(fields, values))
+                        due = due and now - self._cron_seen.get(job_id, 0) >= 60
+                if not due:
+                    continue
+                self._cron_seen[job_id] = now
+                asyncio.create_task(self._run_cron(job))
+
+    async def _run_cron(self, job: dict) -> None:
+        try:
+            result = await self.service.complete(
+                [{'role': 'user', 'content': str(job.get('prompt') or '')}],
+                system_prompt=str(job.get('system_prompt') or ''),
+                provider_id=str(job.get('provider_id') or ''),
+                model=str(job.get('model') or ''),
+                session_id=f"cron:{job.get('id')}",
+            )
+            if self._emit:
+                await self._emit('ai_cron_result', {
+                    'job_id': job.get('id'), 'name': job.get('name'), 'result': result,
+                })
+        except Exception as error:  # noqa: BLE001
+            if self._emit:
+                await self._emit('ai_cron_result', {
+                    'job_id': job.get('id'), 'name': job.get('name'), 'error': _redact(error),
+                })
