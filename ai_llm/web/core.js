@@ -2,6 +2,8 @@ export const BASE = '/api/ext/ai-service';
 export const $ = id => document.getElementById(id);
 export let state = {};
 export let skills = [];
+export let agents = [];
+export let agentMarket = [];
 const THEME_MAP = {'--bg':'--host-bg','--bg2':'--host-bg2','--bg3':'--host-bg3','--bg-float':'--host-float','--text':'--host-text','--text2':'--host-text2','--text3':'--host-text3','--border':'--host-border','--accent':'--host-accent','--accent-hover':'--host-accent-hover','--accent-light':'--host-accent-light','--accent-soft':'--host-accent-soft','--success':'--host-success','--danger':'--host-danger','--warning':'--host-warning','--info':'--host-info'};
 export function syncHostTheme() {
   try {
@@ -60,6 +62,8 @@ export async function streamApi(path, body, onEvent) {
 }
 export function setState(value) { state = value || {}; return state; }
 export function setSkills(value) { skills = Array.isArray(value) ? value : []; }
+export function setAgents(value) { agents = Array.isArray(value) ? value : []; }
+export function setAgentMarket(value) { agentMarket = Array.isArray(value) ? value : []; }
 export function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 export function toast(message, error = false) {
   const node = $('toast'); node.textContent = message; node.className = 'toast show' + (error ? ' error' : '');
@@ -79,8 +83,12 @@ export function providerOptions(current = '', allowAuto = false) {
 function field(key, value, type = 'text') {
   return '<input data-key="' + key + '" type="' + type + '" value="' + esc(value) + '">';
 }
-export function agentTemplate(item) {
-  return '<article class="item" data-id="' + esc(item.id) + '"><div class="item-head"><strong>' + esc(item.name || '新子代理') + '</strong><button class="btn danger remove-item" type="button">删除</button></div><div class="item-body"><div class="grid"><div class="field"><label>ID</label>' + field('id', item.id) + '</div><div class="field"><label>名称</label>' + field('name', item.name) + '</div><div class="field"><label>公开描述</label>' + field('description', item.description || '') + '</div><div class="field"><label>指定接口</label><select data-key="provider_id">' + providerOptions(item.provider_id, true) + '</select></div><div class="field"><label>指定模型</label>' + field('model', item.model || '') + '</div></div><div class="field" style="margin-top:12px"><label>系统 Prompt</label><textarea data-key="system_prompt">' + esc(item.system_prompt || '') + '</textarea></div><label class="switch compact" style="margin-top:12px"><span><b>启用子代理</b></span><input data-key="enabled" type="checkbox" ' + (item.enabled ? 'checked' : '') + '></label></div></article>';
+function agentCard(item) {
+  return '<article class="agent-card"><div class="agent-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '无描述') + '</small><div class="agent-meta"><code>' + esc(item.id) + '</code><span>' + esc(item.kind === 'folder' ? '文件夹' : '单文件') + '</span></div></div><button class="btn danger delete-agent" data-agent-id="' + esc(item.id) + '" type="button">删除</button></article>';
+}
+function marketAgentCard(item) {
+  const installed = !!item.installed;
+  return '<article class="agent-card"><div class="agent-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '无描述') + '</small><div class="agent-meta"><code>' + esc(item.id) + '</code><span>' + esc(item.author || '未知作者') + '</span><span>v' + esc(item.version || '-') + '</span><span>' + esc(item.type === 'folder' ? '文件夹' : '单文件') + '</span></div></div><button class="btn '+ (installed ? '' : 'primary') + ' install-agent" data-agent-id="' + esc(item.id) + '" type="button" '+ (installed ? 'disabled' : '') + '>' + (installed ? '已安装' : '下载') + '</button></article>';
 }
 export function mcpTemplate(item) {
   const headers = JSON.stringify(item.headers || {}, null, 2);
@@ -118,16 +126,14 @@ export function readItems(selector) {
   });
 }
 export function collectCommon() {
-  return {enabled: $('enabled').checked, agent_enabled: $('agent_enabled').checked, auto_switch: $('auto_switch').checked, auto_fetch_models: $('auto_fetch_models').checked, audit_include_content: $('audit_include_content').checked, temperature: Number($('temperature').value), max_tokens: Number($('max_tokens').value), max_tool_rounds: Number($('max_tool_rounds').value), request_timeout: Number($('request_timeout').value), runtime_prompt: $('runtime_prompt').value, context: {max_tokens: Number($('context_max_tokens').value), max_turns: Number($('context_max_turns').value), keep_recent_ratio: Number($('context_keep_ratio').value), compress_enabled: $('context_compress').checked}, skills: {enabled: $('skills_enabled').checked, enabled_ids: [...document.querySelectorAll('[data-skill-id]:checked')].map(node => node.dataset.skillId)}, mcp: {enabled: $('mcp_enabled').checked, servers: readItems('#mcp-list .item')}, sandbox: {...state.sandbox, enabled: $('sandbox_enabled').checked, endpoint: $('sandbox_endpoint').value.trim(), token: $('sandbox_token').value.trim(), execution_timeout: Number($('sandbox_exec_timeout').value)}, subagents: readItems('#agent-list .item'), cron_jobs: readItems('#cron-list .item')};
+  return {enabled: $('enabled').checked, agent_enabled: $('agent_enabled').checked, auto_switch: $('auto_switch').checked, auto_fetch_models: $('auto_fetch_models').checked, audit_include_content: $('audit_include_content').checked, temperature: Number($('temperature').value), max_tokens: Number($('max_tokens').value), max_tool_rounds: Number($('max_tool_rounds').value), request_timeout: Number($('request_timeout').value), runtime_prompt: $('runtime_prompt').value, context: {max_tokens: Number($('context_max_tokens').value), max_turns: Number($('context_max_turns').value), keep_recent_ratio: Number($('context_keep_ratio').value), compress_enabled: $('context_compress').checked}, skills: {enabled: $('skills_enabled').checked, enabled_ids: [...document.querySelectorAll('[data-skill-id]:checked')].map(node => node.dataset.skillId)}, mcp: {enabled: $('mcp_enabled').checked, servers: readItems('#mcp-list .item')}, cron_jobs: readItems('#cron-list .item')};
 }
 export function sectionPayload(section) {
   const common = collectCommon();
   if (section === 'overview') return {enabled: common.enabled, agent_enabled: common.agent_enabled, auto_switch: common.auto_switch, auto_fetch_models: common.auto_fetch_models, audit_include_content: common.audit_include_content, temperature: common.temperature, max_tokens: common.max_tokens, max_tool_rounds: common.max_tool_rounds, request_timeout: common.request_timeout};
-  if (section === 'agents') return {subagents: common.subagents};
   if (section === 'context') return {runtime_prompt: common.runtime_prompt, context: common.context};
   if (section === 'skills') return {skills: common.skills};
   if (section === 'mcp') return {mcp: common.mcp};
-  if (section === 'sandbox') return {sandbox: common.sandbox};
   if (section === 'cron') return {cron_jobs: common.cron_jobs};
   return {};
 }
@@ -168,15 +174,11 @@ export function renderCommon(page = 'overview') {
     $('mcp_enabled').checked = !!state.mcp?.enabled;
     $('mcp-list').innerHTML = (state.mcp?.servers || []).map(mcpTemplate).join('') || '<div class="empty">尚未配置 MCP Server</div>';
     renderCapabilities('mcp', 'plugin-mcp-list');
-  } else if (page === 'sandbox') {
-    $('sandbox_enabled').checked = !!state.sandbox?.enabled;
-    $('sandbox_endpoint').value = state.sandbox?.endpoint || '';
-    $('sandbox_token').value = state.sandbox?.token || '';
-    $('sandbox_exec_timeout').value = state.sandbox?.execution_timeout ?? 20;
   } else if (page === 'cron') {
     $('cron-list').innerHTML = (state.cron_jobs || []).map(cronTemplate).join('') || '<div class="empty">尚未配置计划任务</div>';
   } else if (page === 'agents') {
-    $('agent-list').innerHTML = (state.subagents || []).map(agentTemplate).join('') || '<div class="empty">尚未配置子代理</div>';
+    $('agent-list').innerHTML = agents.map(agentCard).join('') || '<div class="empty">尚未安装 Agent，可上传文件或从下方清单下载</div>';
+    $('agent-market-list').innerHTML = agentMarket.map(marketAgentCard).join('') || '<div class="empty">下载清单为空或暂时无法获取</div>';
     renderCapabilities('agent', 'plugin-agent-list');
   } else if (page === 'test') {
     $('test-provider').innerHTML = providerOptions(state.active_provider);
@@ -190,7 +192,7 @@ export function renderTestModels() {
   $('test-model').innerHTML = '<option value="">默认 / 自动</option>' + models.map(model => '<option value="' + esc(model) + '">' + esc(model) + '</option>').join('');
 }
 export async function loadConfig() {
-  const result = await Promise.all([api('/config'), api('/skills').catch(() => [])]);
-  setState(result[0]); setSkills(result[1]); return state;
+  const result = await Promise.all([api('/config'), api('/skills').catch(() => []), api('/agents').catch(() => []), api('/agents/market').catch(() => [])]);
+  setState(result[0]); setSkills(result[1]); setAgents(result[2]); setAgentMarket(result[3]); return state;
 }
 export async function saveSection(section) { setState(await api('/config', {method: 'PUT', body: JSON.stringify(sectionPayload(section))})); }

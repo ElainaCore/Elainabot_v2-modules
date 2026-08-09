@@ -337,23 +337,6 @@ class AgentRuntime:
             })
         if allow_type('agent') and config.get('agent_enabled'):
             result.extend(self.service.agent_store.tools())
-        sandbox = config.get('sandbox', {})
-        if allow_type('tool') and sandbox.get('enabled') and sandbox.get('endpoint'):
-            result.append({
-                'type': 'function',
-                'function': {
-                    'name': 'sandbox_execute',
-                    'description': '在管理员配置的隔离沙箱中运行代码。',
-                    'parameters': {
-                        'type': 'object',
-                        'properties': {
-                            'language': {'type': 'string', 'enum': ['python', 'javascript', 'shell']},
-                            'code': {'type': 'string'},
-                        },
-                        'required': ['language', 'code'],
-                    },
-                },
-            })
         if allow_type('mcp') and config.get('mcp', {}).get('enabled'):
             await self.refresh_mcp_tools()
             for name, (server, original) in self._mcp_tools.items():
@@ -454,8 +437,6 @@ class AgentRuntime:
             return agent_result
         if name == 'load_skill':
             return self.load_skill(str(arguments.get('skill_id') or ''))
-        if name == 'sandbox_execute':
-            return await self._sandbox(arguments)
         if name == 'load_plugin_skill' and consumer_plugin:
             key = str(arguments.get('capability_key') or '')
             item = next((value for value in self.service.plugin_capabilities(
@@ -514,29 +495,6 @@ class AgentRuntime:
             consumer_plugin=consumer_plugin,
         )
         return {'ok': True, 'capability_key': key, 'text': result['text']}
-
-    async def _sandbox(self, arguments: dict) -> dict:
-        config = self.service.config().get('sandbox', {})
-        endpoint = _public_url(str(config.get('endpoint') or ''))
-        headers = {'Content-Type': 'application/json'}
-        if config.get('token'):
-            headers['Authorization'] = f"Bearer {config['token']}"
-        connector = aiohttp.TCPConnector(resolver=_PublicResolver(), ttl_dns_cache=0)
-        timeout = aiohttp.ClientTimeout(total=min(120, max(5, int(config.get('timeout', 30)))))
-        body = {
-            'language': str(arguments.get('language') or ''),
-            'code': str(arguments.get('code') or '')[:50000],
-            'timeout': min(60, max(1, int(config.get('execution_timeout', 20)))),
-        }
-        try:
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.post(endpoint + '/execute', headers=headers, json=body) as response:
-                    raw = await response.text()
-                    if response.status < 200 or response.status >= 300:
-                        raise RuntimeCapabilityError(f'沙箱返回 HTTP {response.status}')
-            return {'ok': True, 'result': json.loads(raw)}
-        except (aiohttp.ClientError, OSError, ValueError, json.JSONDecodeError) as error:
-            return {'ok': False, 'error': _redact(error)}
 
     async def refresh_mcp_tools(self) -> list[dict]:
         self._mcp_tools.clear()

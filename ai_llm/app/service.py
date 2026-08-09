@@ -345,13 +345,6 @@ DEFAULT_CONFIG = {
     },
     'skills': {'enabled': True, 'enabled_ids': []},
     'mcp': {'enabled': False, 'servers': []},
-    'sandbox': {
-        'enabled': False,
-        'endpoint': '',
-        'token': '',
-        'timeout': 30,
-        'execution_timeout': 20,
-    },
     'plugin_capabilities': [],
     'cron_jobs': [],
     'providers': [
@@ -492,14 +485,6 @@ def normalize_config(value: dict | None) -> dict:
         if server['id']:
             servers.append(server)
     result['mcp'] = {'enabled': bool(mcp.get('enabled', False)), 'servers': servers[:50]}
-    sandbox = result.get('sandbox') if isinstance(result.get('sandbox'), dict) else {}
-    result['sandbox'] = {
-        'enabled': bool(sandbox.get('enabled', False)),
-        'endpoint': str(sandbox.get('endpoint') or '').strip()[:1000],
-        'token': str(sandbox.get('token') or '').strip()[:4000],
-        'timeout': min(120, max(5, int(sandbox.get('timeout', 30)))),
-        'execution_timeout': min(60, max(1, int(sandbox.get('execution_timeout', 20)))),
-    }
     capabilities = []
     seen_capabilities = set()
     for raw in result.get('plugin_capabilities', []) if isinstance(result.get('plugin_capabilities'), list) else []:
@@ -693,9 +678,10 @@ class AIService:
 
     def agent_tools(self, enabled_ids: list[str] | None = None, consumer_plugin: str = '') -> list[dict]:
         selected = set(str(item) for item in (enabled_ids or []))
+        select_all = enabled_ids is None
         result = []
         for item in self.agent_store.catalog():
-            if not selected or f"file:{item['id']}" in selected:
+            if select_all or f"file:{item['id']}" in selected:
                 result.extend([tool for tool in self.agent_store.tools()
                                if tool['function']['name'] == self.agent_store.tool_name(item['id'])])
         if consumer_plugin:
@@ -821,9 +807,6 @@ class AIService:
                     health = saved_health.get(model) or self._health.get((provider['id'], model), {})
                     if health:
                         provider.setdefault('health', {})[model] = health
-            sandbox = result.get('sandbox', {})
-            sandbox['token_set'] = bool(sandbox.get('token'))
-            sandbox['token'] = '********' if sandbox['token_set'] else ''
             for server in result.get('mcp', {}).get('servers', []):
                 headers = server.get('headers', {})
                 server['headers_set'] = bool(headers)
@@ -841,12 +824,6 @@ class AIService:
                 if previous and provider.get('api_key') in ('', '********') and provider.get('api_key_set'):
                     provider['api_key'] = previous.get('api_key', '')
                 provider.pop('api_key_set', None)
-            old_sandbox = self._config.get('sandbox', {})
-            sandbox = value.get('sandbox')
-            if isinstance(sandbox, dict) and sandbox.get('token') in ('', '********') and sandbox.get('token_set'):
-                sandbox['token'] = old_sandbox.get('token', '')
-            if isinstance(sandbox, dict):
-                sandbox.pop('token_set', None)
             old_servers = {
                 item.get('id'): item for item in self._config.get('mcp', {}).get('servers', [])
             }

@@ -13,13 +13,14 @@ from core.base.config import cfg
 from core.base.logger import EXTENSION, get_logger
 from core.plugin.web_pages import register_page, register_route, unregister_page, unregister_route
 
+from .app import agent_market
 from .app.migration import load_ai_dev_config
 from .app.service import DEFAULT_CONFIG, AIService
 
 __module_meta__ = {
     'name': 'AI LLM 服务',
-    'description': '统一管理 LLM、Agent、MCP、Skills、沙箱与计划任务',
-    'version': '1.1.0',
+    'description': '统一管理 LLM、Agent、MCP、Skills 与计划任务',
+    'version': '1.1.1',
     'author': 'ElainaBot',
 }
 
@@ -69,6 +70,11 @@ async def setup(ctx):
     register_route('GET', f'{PREFIX}/skills', _skills)
     register_route('POST', f'{PREFIX}/skills', _upload_skill)
     register_route('DELETE', f'{PREFIX}/skills', _delete_skill)
+    register_route('GET', f'{PREFIX}/agents', _agents)
+    register_route('POST', f'{PREFIX}/agents', _upload_agent)
+    register_route('DELETE', f'{PREFIX}/agents', _delete_agent)
+    register_route('GET', f'{PREFIX}/agents/market', _agent_market)
+    register_route('POST', f'{PREFIX}/agents/install', _install_agent)
     register_route('PUT', f'{PREFIX}/plugin-capabilities', _save_plugin_capabilities)
     register_route('POST', f'{PREFIX}/mcp/refresh', _mcp_refresh)
     register_route('POST', f'{PREFIX}/interrupt', _interrupt)
@@ -107,6 +113,11 @@ async def teardown():
         ('GET', f'{PREFIX}/skills'),
         ('POST', f'{PREFIX}/skills'),
         ('DELETE', f'{PREFIX}/skills'),
+        ('GET', f'{PREFIX}/agents'),
+        ('POST', f'{PREFIX}/agents'),
+        ('DELETE', f'{PREFIX}/agents'),
+        ('GET', f'{PREFIX}/agents/market'),
+        ('POST', f'{PREFIX}/agents/install'),
         ('PUT', f'{PREFIX}/plugin-capabilities'),
         ('POST', f'{PREFIX}/mcp/refresh'),
         ('POST', f'{PREFIX}/interrupt'),
@@ -276,6 +287,66 @@ async def _delete_skill(request):
             return web.json_response({'success': False, 'error': 'Skill 不存在'}, status=404)
         return web.json_response({'success': True, 'data': {'deleted': True}})
     except (ValueError, RuntimeError, OSError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=400)
+
+
+async def _agents(_request):
+    return web.json_response({'success': True, 'data': _service().agent_store.catalog()})
+
+
+async def _upload_agent(request):
+    try:
+        reader = await request.multipart()
+        filename, content = '', b''
+        async for part in reader:
+            if part.name != 'file':
+                continue
+            filename = part.filename or ''
+            chunks, size = [], 0
+            while True:
+                chunk = await part.read_chunk(64 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > 20 * 1024 * 1024:
+                    return web.json_response({
+                        'success': False, 'error': 'Agent 文件不能超过 20 MB',
+                    }, status=413)
+                chunks.append(chunk)
+            content = b''.join(chunks)
+        if not filename:
+            return web.json_response({'success': False, 'error': '请选择 Agent 文件'}, status=400)
+        item = _service().agent_store.upload(filename, content)
+        return web.json_response({'success': True, 'data': item}, status=201)
+    except (ValueError, RuntimeError, OSError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=400)
+
+
+async def _delete_agent(request):
+    try:
+        deleted = _service().agent_store.delete(request.query.get('agent_id', ''))
+        if not deleted:
+            return web.json_response({'success': False, 'error': 'Agent 不存在'}, status=404)
+        return web.json_response({'success': True, 'data': {'deleted': True}})
+    except (ValueError, RuntimeError, OSError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=400)
+
+
+async def _agent_market(_request):
+    try:
+        installed = {item['id'] for item in _service().agent_store.catalog()}
+        items = [{**item, 'installed': item['id'] in installed} for item in await agent_market.catalog()]
+        return web.json_response({'success': True, 'data': items})
+    except (ValueError, RuntimeError, OSError, aiohttp.ClientError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=502)
+
+
+async def _install_agent(request):
+    body = await _json(request)
+    try:
+        item = await agent_market.install(_service().agent_store, str(body.get('agent_id') or ''))
+        return web.json_response({'success': True, 'data': item}, status=201)
+    except (ValueError, RuntimeError, OSError, aiohttp.ClientError) as error:
         return web.json_response({'success': False, 'error': str(error)}, status=400)
 
 

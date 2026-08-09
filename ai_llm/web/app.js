@@ -34,6 +34,29 @@ function bindItems() {
       finally { button.disabled = false; }
     };
   });
+  document.querySelectorAll('.delete-agent').forEach(button => {
+    button.onclick = async () => {
+      const agentId = button.dataset.agentId;
+      if (!confirm('确定删除 Agent “' + agentId + '”？此操作会删除其全部文件。')) return;
+      button.disabled = true;
+      try {
+        await api('/agents?agent_id=' + encodeURIComponent(agentId), {method: 'DELETE'});
+        await loadAll();
+        toast('Agent 已删除');
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    };
+  });
+  document.querySelectorAll('.install-agent:not(:disabled)').forEach(button => {
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        const item = await api('/agents/install', {method: 'POST', body: JSON.stringify({agent_id: button.dataset.agentId})});
+        await loadAll();
+        toast('Agent ' + item.id + ' 已安装');
+      } catch (error) { toast(error.message, true); button.disabled = false; }
+    };
+  });
 }
 function addItem(key, value) {
   setState({...state, [key]: [...(state[key] || []), value]});
@@ -93,7 +116,23 @@ $('skill-upload-form').onsubmit = async event => {
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
 };
-$('add-agent').onclick = () => addItem('subagents', {id: 'agent-' + Date.now(), name: '新子代理', description: '', system_prompt: '', provider_id: '', model: '', enabled: true});
+$('agent-upload-form').onsubmit = async event => {
+  event.preventDefault();
+  const file = $('agent-file').files[0];
+  if (!file) return toast('请选择 Agent 文件', true);
+  const button = $('upload-agent');
+  const form = new FormData();
+  form.append('file', file, file.name);
+  button.disabled = true;
+  try {
+    const item = await api('/agents', {method: 'POST', body: form});
+    $('agent-upload-form').reset();
+    await loadAll();
+    toast('Agent ' + item.id + ' 已上传');
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+};
+$('refresh-agent-market').onclick = () => loadAll().then(() => toast('Agent 清单已刷新')).catch(error => toast(error.message, true));
 $('add-mcp').onclick = () => {
   setState({...state, mcp: {...state.mcp, servers: [...(state.mcp?.servers || []), {id: 'mcp-' + Date.now(), name: '新 MCP', endpoint: '', headers: {}, timeout: 20, enabled: true}]}});
   renderPage();
