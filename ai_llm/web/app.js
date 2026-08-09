@@ -34,26 +34,26 @@ function bindItems() {
       finally { button.disabled = false; }
     };
   });
-  document.querySelectorAll('.delete-agent').forEach(button => {
+  document.querySelectorAll('.delete-model-tool').forEach(button => {
     button.onclick = async () => {
-      const agentId = button.dataset.agentId;
-      if (!confirm('确定删除 Agent “' + agentId + '”？此操作会删除其全部文件。')) return;
+      const toolId = button.dataset.toolId;
+      if (!confirm('确定删除模型工具“' + toolId + '”？此操作会删除其全部文件。')) return;
       button.disabled = true;
       try {
-        await api('/agents?agent_id=' + encodeURIComponent(agentId), {method: 'DELETE'});
+        await api('/tools?tool_id=' + encodeURIComponent(toolId), {method: 'DELETE'});
         await loadAll();
-        toast('Agent 已删除');
+        toast('模型工具已删除');
       } catch (error) { toast(error.message, true); }
       finally { button.disabled = false; }
     };
   });
-  document.querySelectorAll('.install-agent:not(:disabled)').forEach(button => {
+  document.querySelectorAll('.install-model-tool:not(:disabled)').forEach(button => {
     button.onclick = async () => {
       button.disabled = true;
       try {
-        const item = await api('/agents/install', {method: 'POST', body: JSON.stringify({agent_id: button.dataset.agentId})});
+        const item = await api('/tools/install', {method: 'POST', body: JSON.stringify({tool_id: button.dataset.toolId})});
         await loadAll();
-        toast('Agent ' + item.id + ' 已安装');
+        toast('模型工具 ' + item.id + ' 已安装');
       } catch (error) { toast(error.message, true); button.disabled = false; }
     };
   });
@@ -116,23 +116,23 @@ $('skill-upload-form').onsubmit = async event => {
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
 };
-$('agent-upload-form').onsubmit = async event => {
+$('model-tool-upload-form').onsubmit = async event => {
   event.preventDefault();
-  const file = $('agent-file').files[0];
-  if (!file) return toast('请选择 Agent 文件', true);
-  const button = $('upload-agent');
+  const file = $('model-tool-file').files[0];
+  if (!file) return toast('请选择模型工具文件', true);
+  const button = $('upload-model-tool');
   const form = new FormData();
   form.append('file', file, file.name);
   button.disabled = true;
   try {
-    const item = await api('/agents', {method: 'POST', body: form});
-    $('agent-upload-form').reset();
+    const item = await api('/tools', {method: 'POST', body: form});
+    $('model-tool-upload-form').reset();
     await loadAll();
-    toast('Agent ' + item.id + ' 已上传');
+    toast('模型工具 ' + item.id + ' 已上传');
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
 };
-$('refresh-agent-market').onclick = () => loadAll().then(() => toast('Agent 清单已刷新')).catch(error => toast(error.message, true));
+$('refresh-model-tool-market').onclick = () => loadAll().then(() => toast('模型工具市场已刷新')).catch(error => toast(error.message, true));
 $('add-mcp').onclick = () => {
   setState({...state, mcp: {...state.mcp, servers: [...(state.mcp?.servers || []), {id: 'mcp-' + Date.now(), name: '新 MCP', endpoint: '', headers: {}, timeout: 20, enabled: true}]}});
   renderPage();

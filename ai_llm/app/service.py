@@ -16,7 +16,10 @@ from xml.etree import ElementTree
 
 import aiohttp
 
-from .agent_store import AgentStore
+from core.base.config import cfg
+from core.message.event import Event
+
+from .model_tool_store import ModelToolStore
 from .audit import InvocationAudit
 from .runtime import AgentRuntime
 
@@ -334,7 +337,8 @@ DEFAULT_CONFIG = {
     'temperature': 0.7,
     'max_tokens': 8192,
     'max_tool_rounds': 6,
-    'agent_enabled': True,
+    'model_tools_enabled': True,
+    'model_tool_permissions': {},
     'runtime_prompt': '',
     'audit_include_content': False,
     'context': {
@@ -448,7 +452,15 @@ def normalize_config(value: dict | None) -> dict:
     result['temperature'] = min(2.0, max(0.0, float(result.get('temperature', 0.7))))
     result['max_tokens'] = min(131072, max(1, int(result.get('max_tokens', 8192))))
     result['max_tool_rounds'] = min(20, max(1, int(result.get('max_tool_rounds', 6))))
-    result['agent_enabled'] = bool(result.get('agent_enabled', True))
+    result['model_tools_enabled'] = bool(result.get('model_tools_enabled', True))
+    permissions = result.get('model_tool_permissions')
+    result['model_tool_permissions'] = {
+        str(tool_id).strip().casefold()[:64]: (
+            'owner' if str(permission).strip().casefold() == 'owner' else 'all'
+        )
+        for tool_id, permission in (permissions.items() if isinstance(permissions, dict) else [])
+        if str(tool_id).strip()
+    }
     result['runtime_prompt'] = str(result.get('runtime_prompt') or '')[:30000]
     result['audit_include_content'] = bool(result.get('audit_include_content', False))
     context = result.get('context') if isinstance(result.get('context'), dict) else {}
@@ -534,6 +546,14 @@ def normalize_config(value: dict | None) -> dict:
                 'provider_id': str(raw.get('provider_id') or '').strip()[:128],
                 'model': str(raw.get('model') or '').strip()[:256],
                 'enabled': bool(raw.get('enabled', True)),
+                'run_at': max(0, int(raw.get('run_at') or 0)),
+                'one_shot': bool(raw.get('one_shot', False)),
+                'source': str(raw.get('source') or 'panel').strip()[:32],
+                'source_tool_id': str(raw.get('source_tool_id') or '').strip()[:64],
+                'appid': str(raw.get('appid') or '').strip()[:128],
+                'creator_user_id': str(raw.get('creator_user_id') or '').strip()[:128],
+                'target_type': str(raw.get('target_type') or '').strip()[:16],
+                'target_id': str(raw.get('target_id') or '').strip()[:128],
             })
     result['cron_jobs'] = cron_jobs[:100]
     return result
@@ -547,7 +567,7 @@ class AIService:
         self._health: dict[tuple[str, str], dict] = {}
         self._capability_handlers: dict[str, ToolHandler] = {}
         self._online_capabilities: set[str] = set()
-        self.agent_store = AgentStore(data_dir or '.')
+        self.model_tool_store = ModelToolStore(data_dir or '.')
         for provider in self._config.get('providers', []):
             for model, health in (provider.get('health') or {}).items():
                 if isinstance(health, dict):
@@ -660,57 +680,203 @@ class AIService:
     def capability_handler(self, key: str):
         return self._capability_handlers.get(str(key or ''))
 
-    def agent_catalog(self, consumer_plugin: str = '') -> list[dict]:
-        result = [
-            {**item, 'key': f"file:{item['id']}", 'online': True}
-            for item in self.agent_store.catalog()
+    def model_tool_catalog(self, consumer_plugin: str = '') -> list[dict]:
+        """List centrally installed model-callable tools."""
+        permissions = self._config.get('model_tool_permissions', {})
+        return [
+            {
+                **item,
+                'key': f"tool:{item['id']}",
+                'online': True,
+                'permission': permissions.get(item['id'], 'all'),
+            }
+            for item in self.model_tool_store.catalog()
         ]
-        if consumer_plugin:
-            for item in self.plugin_capabilities(consumer_plugin=consumer_plugin, kind='agent'):
-                if item.get('online'):
-                    result.append({
-                        'id': item['key'], 'key': f"plugin:{item['key']}",
-                        'name': item.get('name') or item['id'],
-                        'description': item.get('description') or '',
-                        'kind': 'plugin', 'online': True,
-                    })
-        return result
 
-    def agent_tools(self, enabled_ids: list[str] | None = None, consumer_plugin: str = '') -> list[dict]:
+    @staticmethod
+    def _event_from_context(context: dict | None):
+        event = (context or {}).get('event') if isinstance(context, dict) else None
+        return event if isinstance(event, Event) else None
+
+    @classmethod
+    def _is_owner_context(cls, context: dict | None) -> bool:
+        event = cls._event_from_context(context)
+        if event is None:
+            return False
+        appid = str(getattr(event, 'appid', '') or '')
+        user_id = str(getattr(event, 'user_id', '') or '')
+        bot_config = cfg.get_bot_config(appid) if appid else None
+        owner_ids = {
+            str(item) for item in (bot_config.get('owner_ids') or [])
+        } if isinstance(bot_config, dict) else set()
+        return bool(user_id and user_id in owner_ids)
+
+    def model_tool_allowed(self, tool_id: str, context: dict | None) -> bool:
+        permission = self._config.get('model_tool_permissions', {}).get(
+            str(tool_id or '').strip().casefold(), 'all',
+        )
+        return permission != 'owner' or self._is_owner_context(context)
+
+    def model_tool_definitions(
+        self, enabled_ids: list[str] | None = None, consumer_plugin: str = '',
+        context: dict | None = None,
+    ) -> list[dict]:
         selected = set(str(item) for item in (enabled_ids or []))
         select_all = enabled_ids is None
         result = []
-        for item in self.agent_store.catalog():
-            if select_all or f"file:{item['id']}" in selected:
-                result.extend([tool for tool in self.agent_store.tools()
-                               if tool['function']['name'] == self.agent_store.tool_name(item['id'])])
-        if consumer_plugin:
-            for item in self.plugin_capabilities(consumer_plugin=consumer_plugin, kind='agent'):
-                if f"plugin:{item['key']}" not in selected or not item.get('online'):
-                    continue
-                name = re.sub(r'[^A-Za-z0-9_-]+', '_', f"agent_plugin_{item['source_plugin']}_{item['id']}")[:64]
-                result.append({'type': 'function', 'function': {
-                    'name': name, 'description': item.get('description') or item.get('name') or name,
-                    'parameters': {'type': 'object', 'properties': {'task': {'type': 'string'}}, 'required': ['task']},
-                }})
+        definitions = self.model_tool_store.tools()
+        for item in self.model_tool_store.catalog():
+            if (
+                (select_all or f"tool:{item['id']}" in selected)
+                and self.model_tool_allowed(item['id'], context)
+            ):
+                result.extend([
+                    tool for tool in definitions
+                    if tool['function']['name'] == self.model_tool_store.tool_name(item['id'])
+                ])
         return result
 
-    async def call_agent_tool(self, name: str, arguments: dict, *, consumer_plugin: str = '', context: dict | None = None):
-        value = await self.agent_store.call(name, arguments, context)
-        if value is not None:
-            return value
-        for item in self.plugin_capabilities(consumer_plugin=consumer_plugin, kind='agent') if consumer_plugin else []:
-            tool_name = re.sub(r'[^A-Za-z0-9_-]+', '_', f"agent_plugin_{item['source_plugin']}_{item['id']}")[:64]
-            if tool_name != name or not item.get('online'):
-                continue
-            handler = self.capability_handler(item['key'])
-            if handler is not None:
-                value = handler(item['id'], arguments)
-                return await value if asyncio.iscoroutine(value) else value
-            return await self.runtime._delegate_plugin_agent({
-                'capability_key': item['key'], 'task': str(arguments.get('task') or '')[:12000],
-            }, consumer_plugin)
-        return None
+    async def call_model_tool(
+        self, name: str, arguments: dict, *, consumer_plugin: str = '',
+        context: dict | None = None,
+    ):
+        item = next((
+            row for row in self.model_tool_store.catalog()
+            if self.model_tool_store.tool_name(row['id']) == name
+        ), None)
+        if item is None:
+            return None
+        if not self.model_tool_allowed(item['id'], context):
+            return {'ok': False, 'error': '该模型工具仅主人可用'}
+        runtime_context = dict(context or {})
+
+        async def schedule_task(options: dict):
+            return await self.manage_model_tool_task(item['id'], options, runtime_context)
+
+        runtime_context['schedule_task'] = schedule_task
+        return await self.model_tool_store.call(name, arguments, runtime_context)
+
+    async def manage_model_tool_task(
+        self, tool_id: str, options: dict, context: dict | None = None,
+    ) -> dict:
+        event = self._event_from_context(context)
+        if event is None:
+            return {'ok': False, 'error': '定时任务必须由真实消息触发'}
+        values = options if isinstance(options, dict) else {}
+        action = str(values.get('action') or 'create').strip().casefold()
+        appid = str(event.appid or '')
+        creator = str(event.user_id or '')
+        if not appid or not creator:
+            return {'ok': False, 'error': '缺少消息触发者身份'}
+        if action == 'create':
+            return await self.create_model_tool_task(tool_id, values, context)
+        jobs = [
+            item for item in self._config.get('cron_jobs', [])
+            if item.get('source') == 'model_tool'
+            and item.get('appid') == appid
+            and item.get('creator_user_id') == creator
+        ]
+        if action == 'list':
+            return {
+                'ok': True,
+                'tasks': [{
+                    'task_id': item.get('id'),
+                    'name': item.get('name'),
+                    'prompt': item.get('prompt'),
+                    'run_at': item.get('run_at'),
+                    'target_type': item.get('target_type'),
+                } for item in jobs],
+            }
+        if action == 'cancel':
+            task_id = str(values.get('task_id') or '').strip()
+            if not task_id or not any(item.get('id') == task_id for item in jobs):
+                return {'ok': False, 'error': '定时任务不存在或不属于当前触发者'}
+            await self.consume_one_shot_task(task_id)
+            return {'ok': True, 'cancelled': True, 'task_id': task_id}
+        return {'ok': False, 'error': '不支持的定时任务操作'}
+
+    async def create_model_tool_task(
+        self, tool_id: str, options: dict, context: dict | None = None,
+    ) -> dict:
+        event = self._event_from_context(context)
+        if event is None:
+            return {'ok': False, 'error': '定时任务必须由真实消息触发'}
+        values = options if isinstance(options, dict) else {}
+        prompt = str(values.get('prompt') or values.get('content') or '').strip()[:30000]
+        if not prompt:
+            return {'ok': False, 'error': '定时任务内容不能为空'}
+        try:
+            delay_seconds = int(values.get('delay_seconds') or 0)
+            run_at = int(values.get('run_at') or 0)
+        except (TypeError, ValueError):
+            return {'ok': False, 'error': '定时任务时间格式无效'}
+        now = int(time.time())
+        if delay_seconds:
+            run_at = now + delay_seconds
+        if run_at < now + 10 or run_at > now + 31_536_000:
+            return {'ok': False, 'error': '定时任务必须安排在 10 秒后至 1 年内'}
+        target_type = str(getattr(event, 'chat_type', '') or '')
+        target_id = str(getattr(event, 'chat_id', '') or '')
+        if target_type not in {'group', 'direct', 'channel'} or not target_id:
+            return {'ok': False, 'error': '当前消息类型不支持定时推送'}
+        appid = str(getattr(event, 'appid', '') or '')
+        creator = str(getattr(event, 'user_id', '') or '')
+        if not appid or not creator:
+            return {'ok': False, 'error': '缺少消息触发者身份'}
+        task_id = 'model-tool-' + uuid.uuid4().hex[:16]
+        job = {
+            'id': task_id,
+            'name': str(values.get('name') or '模型工具定时任务').strip()[:100],
+            'cron': '',
+            'interval_seconds': 0,
+            'prompt': prompt,
+            'system_prompt': '',
+            'provider_id': '',
+            'model': '',
+            'enabled': True,
+            'run_at': run_at,
+            'one_shot': True,
+            'source': 'model_tool',
+            'source_tool_id': str(tool_id or '')[:64],
+            'appid': appid,
+            'creator_user_id': creator,
+            'target_type': target_type,
+            'target_id': target_id,
+        }
+        async with self._lock:
+            existing = self._config.get('cron_jobs', [])
+            if len(existing) >= 100:
+                return {'ok': False, 'error': '定时任务总数已达到 100 个上限'}
+            active_for_user = sum(
+                1 for item in existing
+                if item.get('source') == 'model_tool'
+                and item.get('appid') == appid
+                and item.get('creator_user_id') == creator
+                and item.get('enabled')
+            )
+            if active_for_user >= 20:
+                return {'ok': False, 'error': '每个用户最多创建 20 个待执行定时任务'}
+            merged = copy.deepcopy(self._config)
+            merged['cron_jobs'] = [*existing, job]
+            self._config = normalize_config(merged)
+            self._save_callback(self._config)
+        return {
+            'ok': True,
+            'task_id': task_id,
+            'run_at': run_at,
+            'target_type': target_type,
+            'target_id': target_id,
+        }
+
+    async def consume_one_shot_task(self, task_id: str) -> None:
+        async with self._lock:
+            merged = copy.deepcopy(self._config)
+            merged['cron_jobs'] = [
+                item for item in merged.get('cron_jobs', [])
+                if str(item.get('id') or '') != str(task_id or '')
+            ]
+            self._config = normalize_config(merged)
+            self._save_callback(self._config)
 
     def list_capabilities(self, consumer_plugin: str, kind: str = '') -> list[dict]:
         """List online capabilities that a plugin may discover and call."""
@@ -833,6 +999,20 @@ class AIService:
                     server['headers'] = previous.get('headers', {})
                 server.pop('headers_set', None)
             merged = copy.deepcopy(self._config)
+            if 'cron_jobs' in value and isinstance(value.get('cron_jobs'), list):
+                # Panel saves edit administrative jobs only; message-created reminders survive.
+                user_jobs = [
+                    copy.deepcopy(item) for item in self._config.get('cron_jobs', [])
+                    if isinstance(item, dict) and item.get('source') == 'model_tool'
+                ]
+                user_job_ids = {str(item.get('id') or '') for item in user_jobs}
+                value['cron_jobs'] = [
+                    *[
+                        item for item in value['cron_jobs']
+                        if str(item.get('id') or '') not in user_job_ids
+                    ],
+                    *user_jobs,
+                ]
             merged.update(value)
             self._config = normalize_config(merged)
             self.audit.set_include_content(self._config.get('audit_include_content', False))
@@ -1465,6 +1645,7 @@ class AIService:
                 allow_handoff=allow_handoff,
                 consumer_plugin=consumer_plugin,
                 capability_types=runtime_capabilities,
+                context=tool_context,
             ) if enable_runtime_tools else []
             caller_tools = list(tools or [])
             caller_tool_names = {

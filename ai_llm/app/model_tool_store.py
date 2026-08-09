@@ -1,4 +1,4 @@
-"""File and folder based Agents managed by AI LLM."""
+"""File and folder based model tools managed by AI LLM."""
 from __future__ import annotations
 
 import ast
@@ -20,7 +20,7 @@ import aiohttp
 
 from .runtime import RuntimeCapabilityError, _PublicResolver, _public_url
 
-_AGENT_ID = re.compile(r'^[a-z][a-z0-9_-]{0,63}$')
+_MODEL_TOOL_ID = re.compile(r'^[a-z][a-z0-9_-]{0,63}$')
 _TOOL_NAME = re.compile(r'[^A-Za-z0-9_-]+')
 _DANGEROUS_IMPORTS = {
     'ctypes', 'importlib', 'os', 'pathlib', 'pickle', 'shutil', 'socket',
@@ -31,13 +31,13 @@ _UPLOAD_LIMIT = 20 * 1024 * 1024
 _FILE_LIMIT = 200
 
 
-class AgentFileError(ValueError):
+class ModelToolFileError(ValueError):
     pass
 
 
-class AgentStore:
+class ModelToolStore:
     def __init__(self, data_dir: str):
-        self.directory = os.path.abspath(os.path.join(data_dir or '.', 'agents'))
+        self.directory = os.path.abspath(os.path.join(data_dir or '.', 'model_tools'))
         os.makedirs(self.directory, exist_ok=True)
 
     @staticmethod
@@ -45,7 +45,7 @@ class AgentStore:
         try:
             tree = ast.parse(source, filename=filename)
         except SyntaxError as error:
-            raise AgentFileError(f'Python 语法错误：{error.msg}') from error
+            raise ModelToolFileError(f'Python 语法错误：{error.msg}') from error
         metadata = None
         has_run = False
         for node in ast.walk(tree):
@@ -54,36 +54,36 @@ class AgentStore:
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 names = [item.name.split('.')[0] for item in node.names]
                 if any(name in _DANGEROUS_IMPORTS for name in names):
-                    raise AgentFileError('Agent 禁止导入危险模块')
+                    raise ModelToolFileError('模型工具禁止导入危险模块')
             if isinstance(node, ast.Name) and node.id in {
                 '__import__', 'compile', 'eval', 'exec', 'input', 'open',
             }:
-                raise AgentFileError(f'Agent 禁止使用 {node.id}')
+                raise ModelToolFileError(f'模型工具禁止使用 {node.id}')
             if isinstance(node, ast.Attribute) and node.attr.startswith('__'):
-                raise AgentFileError('Agent 禁止访问双下划线属性')
+                raise ModelToolFileError('模型工具禁止访问双下划线属性')
             if (
                 isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
-                and node.targets[0].id == 'AGENT'
+                and node.targets[0].id == 'TOOL'
             ):
                 try:
                     metadata = ast.literal_eval(node.value)
                 except (TypeError, ValueError) as error:
-                    raise AgentFileError('AGENT 必须是静态字典') from error
+                    raise ModelToolFileError('TOOL 必须是静态字典') from error
         if not isinstance(metadata, dict) or not has_run:
-            raise AgentFileError('Agent 必须定义 AGENT 字典和 run(arguments, context)')
-        agent_id = str(metadata.get('id') or '').strip().casefold()
-        if not _AGENT_ID.fullmatch(agent_id):
-            raise AgentFileError('Agent ID 格式无效')
+            raise ModelToolFileError('模型工具必须定义 TOOL 字典和 run(arguments, context)')
+        tool_id = str(metadata.get('id') or '').strip().casefold()
+        if not _MODEL_TOOL_ID.fullmatch(tool_id):
+            raise ModelToolFileError('模型工具 ID 格式无效')
         parameters = metadata.get('parameters') or {'type': 'object', 'properties': {}}
         if not isinstance(parameters, dict) or parameters.get('type') != 'object':
-            raise AgentFileError('parameters 必须是 object JSON Schema')
+            raise ModelToolFileError('parameters 必须是 object JSON Schema')
         description = str(metadata.get('description') or '').strip()[:500]
         if not description:
-            raise AgentFileError('Agent description 不能为空')
+            raise ModelToolFileError('模型工具 description 不能为空')
         return {
-            'id': agent_id,
-            'name': str(metadata.get('name') or agent_id).strip()[:100],
+            'id': tool_id,
+            'name': str(metadata.get('name') or tool_id).strip()[:100],
             'description': description,
             'parameters': copy.deepcopy(parameters),
             'enabled': bool(metadata.get('enabled', True)),
@@ -91,14 +91,14 @@ class AgentStore:
 
     @staticmethod
     def _entry(path: str) -> str:
-        return os.path.join(path, 'agent.py') if os.path.isdir(path) else path
+        return os.path.join(path, 'tool.py') if os.path.isdir(path) else path
 
     def catalog(self) -> list[dict]:
         result = []
         for name in sorted(os.listdir(self.directory)):
             path = os.path.join(self.directory, name)
             entry = self._entry(path)
-            valid_name = name.endswith('.py') if os.path.isfile(path) else bool(_AGENT_ID.fullmatch(name))
+            valid_name = name.endswith('.py') if os.path.isfile(path) else bool(_MODEL_TOOL_ID.fullmatch(name))
             if not valid_name or not os.path.isfile(entry):
                 continue
             try:
@@ -110,11 +110,11 @@ class AgentStore:
                 result.append({
                     **metadata,
                     'filename': name,
-                    'entry': 'agent.py' if os.path.isdir(path) else name,
+                    'entry': 'tool.py' if os.path.isdir(path) else name,
                     'kind': 'folder' if os.path.isdir(path) else 'file',
-                    'source': 'file',
+                    'source': 'model_tool',
                 })
-            except (AgentFileError, OSError, UnicodeDecodeError):
+            except (ModelToolFileError, OSError, UnicodeDecodeError):
                 continue
         return result
 
@@ -130,58 +130,58 @@ class AgentStore:
             for name in names:
                 path = os.path.join(base, name)
                 if os.path.islink(path):
-                    raise AgentFileError('Agent 不允许符号链接')
+                    raise ModelToolFileError('模型工具不允许符号链接')
                 count += 1
                 total += os.path.getsize(path)
                 if count > _FILE_LIMIT or total > _UPLOAD_LIMIT:
-                    raise AgentFileError('Agent 文件数量或总大小超限')
+                    raise ModelToolFileError('模型工具文件数量或总大小超限')
 
     def install_archive(self, content: bytes) -> dict:
         if not content or len(content) > _UPLOAD_LIMIT:
-            raise AgentFileError('Agent 压缩包为空或超过 20MB')
+            raise ModelToolFileError('模型工具压缩包为空或超过 20MB')
         try:
             archive = zipfile.ZipFile(io.BytesIO(content))
         except zipfile.BadZipFile as error:
-            raise AgentFileError('Agent 压缩包格式无效') from error
-        staging_root = tempfile.mkdtemp(prefix='.agent-upload-', dir=self.directory)
+            raise ModelToolFileError('模型工具压缩包格式无效') from error
+        staging_root = tempfile.mkdtemp(prefix='.model-tool-upload-', dir=self.directory)
         try:
             with archive:
                 members = [item for item in archive.infolist() if not item.is_dir()]
                 if not members or len(members) > _FILE_LIMIT:
-                    raise AgentFileError('Agent 压缩包文件数量无效')
+                    raise ModelToolFileError('模型工具压缩包文件数量无效')
                 if sum(item.file_size for item in members) > _UPLOAD_LIMIT:
-                    raise AgentFileError('Agent 解压后不能超过 20MB')
+                    raise ModelToolFileError('模型工具解压后不能超过 20MB')
                 for item in members:
                     normalized = item.filename.replace('\\', '/').strip('/')
                     parts = [part for part in normalized.split('/') if part not in {'', '.'}]
                     if not parts or '..' in parts or os.path.isabs(item.filename):
-                        raise AgentFileError('Agent 压缩包包含不安全路径')
+                        raise ModelToolFileError('模型工具压缩包包含不安全路径')
                     if (item.external_attr >> 16) & 0o170000 == 0o120000:
-                        raise AgentFileError('Agent 压缩包不能包含符号链接')
+                        raise ModelToolFileError('模型工具压缩包不能包含符号链接')
                     target = os.path.abspath(os.path.join(staging_root, *parts))
                     if not target.startswith(staging_root + os.sep):
-                        raise AgentFileError('Agent 压缩包包含越界路径')
+                        raise ModelToolFileError('模型工具压缩包包含越界路径')
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     with archive.open(item) as source, open(target, 'wb') as output:
                         shutil.copyfileobj(source, output)
             root = staging_root
-            if not os.path.isfile(os.path.join(root, 'agent.py')):
+            if not os.path.isfile(os.path.join(root, 'tool.py')):
                 children = [os.path.join(root, name) for name in os.listdir(root)]
                 if len(children) == 1 and os.path.isdir(children[0]):
                     root = children[0]
             self._validate_tree(root)
-            entry = os.path.join(root, 'agent.py')
+            entry = os.path.join(root, 'tool.py')
             if not os.path.isfile(entry):
-                raise AgentFileError('文件夹 Agent 根目录必须包含 agent.py')
+                raise ModelToolFileError('文件夹模型工具根目录必须包含 tool.py')
             with open(entry, encoding='utf-8') as file:
                 metadata = self._metadata(file.read(_ENTRY_LIMIT + 1), entry)
             destination = os.path.join(self.directory, metadata['id'])
             if os.path.exists(destination) or os.path.exists(destination + '.py'):
-                raise AgentFileError(f"Agent {metadata['id']} 已存在")
+                raise ModelToolFileError(f"模型工具 {metadata['id']} 已存在")
             os.replace(root, destination)
             return {
-                **metadata, 'filename': metadata['id'], 'entry': 'agent.py',
-                'kind': 'folder', 'source': 'file',
+                **metadata, 'filename': metadata['id'], 'entry': 'tool.py',
+                'kind': 'folder', 'source': 'model_tool',
             }
         finally:
             shutil.rmtree(staging_root, ignore_errors=True)
@@ -191,29 +191,29 @@ class AgentStore:
         if name.casefold().endswith('.zip'):
             return self.install_archive(content)
         if not name.casefold().endswith('.py') or len(content) > _ENTRY_LIMIT:
-            raise AgentFileError('仅支持不超过 512KB 的 .py 或 Agent ZIP')
+            raise ModelToolFileError('仅支持不超过 512KB 的 .py 或模型工具 ZIP')
         try:
             source = content.decode('utf-8-sig')
         except UnicodeDecodeError as error:
-            raise AgentFileError('Agent 文件必须使用 UTF-8 编码') from error
+            raise ModelToolFileError('模型工具文件必须使用 UTF-8 编码') from error
         metadata = self._metadata(source, name)
         destination = os.path.join(self.directory, metadata['id'] + '.py')
         if os.path.isdir(os.path.join(self.directory, metadata['id'])):
-            raise AgentFileError(f"Agent {metadata['id']} 已存在")
+            raise ModelToolFileError(f"模型工具 {metadata['id']} 已存在")
         with open(destination, 'w', encoding='utf-8', newline='\n') as file:
             file.write(source)
         return {
             **metadata, 'filename': metadata['id'] + '.py',
-            'entry': metadata['id'] + '.py', 'kind': 'file', 'source': 'file',
+            'entry': metadata['id'] + '.py', 'kind': 'file', 'source': 'model_tool',
         }
 
-    def delete(self, agent_id: str) -> bool:
-        agent_id = str(agent_id or '').strip().casefold()
-        if not _AGENT_ID.fullmatch(agent_id):
+    def delete(self, tool_id: str) -> bool:
+        tool_id = str(tool_id or '').strip().casefold()
+        if not _MODEL_TOOL_ID.fullmatch(tool_id):
             return False
         for path in (
-            os.path.join(self.directory, agent_id + '.py'),
-            os.path.join(self.directory, agent_id),
+            os.path.join(self.directory, tool_id + '.py'),
+            os.path.join(self.directory, tool_id),
         ):
             if os.path.isfile(path):
                 os.remove(path)
@@ -224,8 +224,8 @@ class AgentStore:
         return False
 
     @staticmethod
-    def tool_name(agent_id: str) -> str:
-        return _TOOL_NAME.sub('_', 'agent_' + str(agent_id))[:64]
+    def tool_name(tool_id: str) -> str:
+        return _TOOL_NAME.sub('_', 'tool_' + str(tool_id))[:64]
 
     def tools(self) -> list[dict]:
         return [{
@@ -253,10 +253,10 @@ class AgentStore:
             return None
         path = os.path.join(self.directory, item['filename'])
         if item['kind'] == 'folder':
-            path = os.path.join(path, 'agent.py')
+            path = os.path.join(path, 'tool.py')
         with open(path, encoding='utf-8') as file:
             self._metadata(file.read(_ENTRY_LIMIT + 1), path)
-        module_name = 'ai_agent_' + hashlib.sha256(path.encode()).hexdigest()[:16]
+        module_name = 'ai_model_tool_' + hashlib.sha256(path.encode()).hexdigest()[:16]
         search = [os.path.dirname(path)] if item['kind'] == 'folder' else None
         spec = importlib.util.spec_from_file_location(module_name, path, submodule_search_locations=search)
         module = importlib.util.module_from_spec(spec)
@@ -270,7 +270,7 @@ class AgentStore:
                 value = await asyncio.wait_for(value, timeout=45)
             return value if isinstance(value, dict) else {'ok': True, 'result': value}
         except asyncio.TimeoutError:
-            return {'ok': False, 'error': 'Agent 执行超时'}
+            return {'ok': False, 'error': '模型工具执行超时'}
         except Exception as error:
             return {'ok': False, 'error': str(error)[:300]}
         finally:

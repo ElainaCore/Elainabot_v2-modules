@@ -2,8 +2,8 @@ export const BASE = '/api/ext/ai-service';
 export const $ = id => document.getElementById(id);
 export let state = {};
 export let skills = [];
-export let agents = [];
-export let agentMarket = [];
+export let modelTools = [];
+export let modelToolMarket = [];
 const THEME_MAP = {'--bg':'--host-bg','--bg2':'--host-bg2','--bg3':'--host-bg3','--bg-float':'--host-float','--text':'--host-text','--text2':'--host-text2','--text3':'--host-text3','--border':'--host-border','--accent':'--host-accent','--accent-hover':'--host-accent-hover','--accent-light':'--host-accent-light','--accent-soft':'--host-accent-soft','--success':'--host-success','--danger':'--host-danger','--warning':'--host-warning','--info':'--host-info'};
 export function syncHostTheme() {
   try {
@@ -62,8 +62,8 @@ export async function streamApi(path, body, onEvent) {
 }
 export function setState(value) { state = value || {}; return state; }
 export function setSkills(value) { skills = Array.isArray(value) ? value : []; }
-export function setAgents(value) { agents = Array.isArray(value) ? value : []; }
-export function setAgentMarket(value) { agentMarket = Array.isArray(value) ? value : []; }
+export function setModelTools(value) { modelTools = Array.isArray(value) ? value : []; }
+export function setModelToolMarket(value) { modelToolMarket = Array.isArray(value) ? value : []; }
 export function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 export function toast(message, error = false) {
   const node = $('toast'); node.textContent = message; node.className = 'toast show' + (error ? ' error' : '');
@@ -83,12 +83,13 @@ export function providerOptions(current = '', allowAuto = false) {
 function field(key, value, type = 'text') {
   return '<input data-key="' + key + '" type="' + type + '" value="' + esc(value) + '">';
 }
-function agentCard(item) {
-  return '<article class="agent-card"><div class="agent-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '无描述') + '</small><div class="agent-meta"><code>' + esc(item.id) + '</code><span>' + esc(item.kind === 'folder' ? '文件夹' : '单文件') + '</span></div></div><button class="btn danger delete-agent" data-agent-id="' + esc(item.id) + '" type="button">删除</button></article>';
+function modelToolCard(item) {
+  const permission = (state.model_tool_permissions || {})[item.id] === 'owner' ? 'owner' : 'all';
+  return '<article class="model-tool-card"><div class="model-tool-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '无描述') + '</small><div class="model-tool-meta"><code>' + esc(item.id) + '</code><span>' + esc(item.kind === 'folder' ? '文件夹' : '单文件') + '</span></div><label class="model-tool-permission"><span>调用权限</span><select data-model-tool-permission="' + esc(item.id) + '"><option value="all"' + (permission === 'all' ? ' selected' : '') + '>所有人</option><option value="owner"' + (permission === 'owner' ? ' selected' : '') + '>仅主人</option></select></label></div><button class="btn danger delete-model-tool" data-tool-id="' + esc(item.id) + '" type="button">删除</button></article>';
 }
-function marketAgentCard(item) {
+function marketModelToolCard(item) {
   const installed = !!item.installed;
-  return '<article class="agent-card"><div class="agent-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '无描述') + '</small><div class="agent-meta"><code>' + esc(item.id) + '</code><span>' + esc(item.author || '未知作者') + '</span><span>v' + esc(item.version || '-') + '</span><span>' + esc(item.type === 'folder' ? '文件夹' : '单文件') + '</span></div></div><button class="btn '+ (installed ? '' : 'primary') + ' install-agent" data-agent-id="' + esc(item.id) + '" type="button" '+ (installed ? 'disabled' : '') + '>' + (installed ? '已安装' : '下载') + '</button></article>';
+  return '<article class="model-tool-card"><div class="model-tool-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '无描述') + '</small><div class="model-tool-meta"><code>' + esc(item.id) + '</code><span>' + esc(item.author || '未知作者') + '</span><span>v' + esc(item.version || '-') + '</span><span>' + esc(item.type === 'folder' ? '文件夹' : '单文件') + '</span></div></div><button class="btn '+ (installed ? '' : 'primary') + ' install-model-tool" data-tool-id="' + esc(item.id) + '" type="button" '+ (installed ? 'disabled' : '') + '>' + (installed ? '已安装' : '下载') + '</button></article>';
 }
 export function mcpTemplate(item) {
   const headers = JSON.stringify(item.headers || {}, null, 2);
@@ -126,15 +127,23 @@ export function readItems(selector) {
   });
 }
 export function collectCommon() {
-  return {enabled: $('enabled').checked, agent_enabled: $('agent_enabled').checked, auto_switch: $('auto_switch').checked, auto_fetch_models: $('auto_fetch_models').checked, audit_include_content: $('audit_include_content').checked, temperature: Number($('temperature').value), max_tokens: Number($('max_tokens').value), max_tool_rounds: Number($('max_tool_rounds').value), request_timeout: Number($('request_timeout').value), runtime_prompt: $('runtime_prompt').value, context: {max_tokens: Number($('context_max_tokens').value), max_turns: Number($('context_max_turns').value), keep_recent_ratio: Number($('context_keep_ratio').value), compress_enabled: $('context_compress').checked}, skills: {enabled: $('skills_enabled').checked, enabled_ids: [...document.querySelectorAll('[data-skill-id]:checked')].map(node => node.dataset.skillId)}, mcp: {enabled: $('mcp_enabled').checked, servers: readItems('#mcp-list .item')}, cron_jobs: readItems('#cron-list .item')};
+  return {enabled: $('enabled').checked, model_tools_enabled: $('model_tools_enabled').checked, auto_switch: $('auto_switch').checked, auto_fetch_models: $('auto_fetch_models').checked, audit_include_content: $('audit_include_content').checked, temperature: Number($('temperature').value), max_tokens: Number($('max_tokens').value), max_tool_rounds: Number($('max_tool_rounds').value), request_timeout: Number($('request_timeout').value), runtime_prompt: $('runtime_prompt').value, context: {max_tokens: Number($('context_max_tokens').value), max_turns: Number($('context_max_turns').value), keep_recent_ratio: Number($('context_keep_ratio').value), compress_enabled: $('context_compress').checked}, skills: {enabled: $('skills_enabled').checked, enabled_ids: [...document.querySelectorAll('[data-skill-id]:checked')].map(node => node.dataset.skillId)}, mcp: {enabled: $('mcp_enabled').checked, servers: readItems('#mcp-list .item')}, cron_jobs: readItems('#cron-list .item')};
+}
+export function readModelToolPermissions() {
+  const permissions = {...(state.model_tool_permissions || {})};
+  document.querySelectorAll('[data-model-tool-permission]').forEach(select => {
+    permissions[select.dataset.modelToolPermission] = select.value === 'owner' ? 'owner' : 'all';
+  });
+  return permissions;
 }
 export function sectionPayload(section) {
   const common = collectCommon();
-  if (section === 'overview') return {enabled: common.enabled, agent_enabled: common.agent_enabled, auto_switch: common.auto_switch, auto_fetch_models: common.auto_fetch_models, audit_include_content: common.audit_include_content, temperature: common.temperature, max_tokens: common.max_tokens, max_tool_rounds: common.max_tool_rounds, request_timeout: common.request_timeout};
+  if (section === 'overview') return {enabled: common.enabled, model_tools_enabled: common.model_tools_enabled, auto_switch: common.auto_switch, auto_fetch_models: common.auto_fetch_models, audit_include_content: common.audit_include_content, temperature: common.temperature, max_tokens: common.max_tokens, max_tool_rounds: common.max_tool_rounds, request_timeout: common.request_timeout};
   if (section === 'context') return {runtime_prompt: common.runtime_prompt, context: common.context};
   if (section === 'skills') return {skills: common.skills};
   if (section === 'mcp') return {mcp: common.mcp};
   if (section === 'cron') return {cron_jobs: common.cron_jobs};
+  if (section === 'model-tools') return {model_tool_permissions: readModelToolPermissions()};
   return {};
 }
 function renderCapabilities(kind, id) {
@@ -149,7 +158,7 @@ function renderCapabilities(kind, id) {
 
 export function renderCommon(page = 'overview') {
   if (page === 'overview') {
-    ['enabled', 'agent_enabled', 'auto_switch', 'auto_fetch_models', 'audit_include_content'].forEach(key => $(key).checked = !!state[key]);
+    ['enabled', 'model_tools_enabled', 'auto_switch', 'auto_fetch_models', 'audit_include_content'].forEach(key => $(key).checked = !!state[key]);
     ['temperature', 'max_tokens', 'max_tool_rounds', 'request_timeout'].forEach(key => $(key).value = state[key] ?? '');
   }
   const enabled = (state.providers || []).filter(item => item.enabled);
@@ -175,10 +184,12 @@ export function renderCommon(page = 'overview') {
     $('mcp-list').innerHTML = (state.mcp?.servers || []).map(mcpTemplate).join('') || '<div class="empty">尚未配置 MCP Server</div>';
     renderCapabilities('mcp', 'plugin-mcp-list');
   } else if (page === 'cron') {
-    $('cron-list').innerHTML = (state.cron_jobs || []).map(cronTemplate).join('') || '<div class="empty">尚未配置计划任务</div>';
+    const panelJobs = (state.cron_jobs || []).filter(item => item.source !== 'model_tool');
+    $('cron-list').innerHTML = panelJobs.map(cronTemplate).join('') || '<div class="empty">尚未配置计划任务</div>';
+  } else if (page === 'model-tools') {
+    $('model-tool-list').innerHTML = modelTools.map(modelToolCard).join('') || '<div class="empty">尚未安装模型工具</div>';
+    $('model-tool-market-list').innerHTML = modelToolMarket.map(marketModelToolCard).join('') || '<div class="empty">市场清单为空或暂时无法获取</div>';
   } else if (page === 'agents') {
-    $('agent-list').innerHTML = agents.map(agentCard).join('') || '<div class="empty">尚未安装 Agent，可上传文件或从下方清单下载</div>';
-    $('agent-market-list').innerHTML = agentMarket.map(marketAgentCard).join('') || '<div class="empty">下载清单为空或暂时无法获取</div>';
     renderCapabilities('agent', 'plugin-agent-list');
   } else if (page === 'test') {
     $('test-provider').innerHTML = providerOptions(state.active_provider);
@@ -192,7 +203,7 @@ export function renderTestModels() {
   $('test-model').innerHTML = '<option value="">默认 / 自动</option>' + models.map(model => '<option value="' + esc(model) + '">' + esc(model) + '</option>').join('');
 }
 export async function loadConfig() {
-  const result = await Promise.all([api('/config'), api('/skills').catch(() => []), api('/agents').catch(() => []), api('/agents/market').catch(() => [])]);
-  setState(result[0]); setSkills(result[1]); setAgents(result[2]); setAgentMarket(result[3]); return state;
+  const result = await Promise.all([api('/config'), api('/skills').catch(() => []), api('/tools').catch(() => []), api('/tools/market').catch(() => [])]);
+  setState(result[0]); setSkills(result[1]); setModelTools(result[2]); setModelToolMarket(result[3]); return state;
 }
 export async function saveSection(section) { setState(await api('/config', {method: 'PUT', body: JSON.stringify(sectionPayload(section))})); }

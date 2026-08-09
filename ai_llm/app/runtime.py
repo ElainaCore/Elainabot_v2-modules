@@ -312,7 +312,7 @@ class AgentRuntime:
 
     async def tools(
         self, *, allow_handoff: bool = True, consumer_plugin: str = '',
-        capability_types: list[str] | None = None,
+        capability_types: list[str] | None = None, context: dict | None = None,
     ) -> list[dict]:
         config = self.service.config()
         result = []
@@ -335,8 +335,10 @@ class AgentRuntime:
                     },
                 },
             })
-        if allow_type('agent') and config.get('agent_enabled'):
-            result.extend(self.service.agent_store.tools())
+        if allow_type('tool') and config.get('model_tools_enabled'):
+            result.extend(self.service.model_tool_definitions(
+                None, consumer_plugin=consumer_plugin, context=context,
+            ))
         if allow_type('mcp') and config.get('mcp', {}).get('enabled'):
             await self.refresh_mcp_tools()
             for name, (server, original) in self._mcp_tools.items():
@@ -430,11 +432,11 @@ class AgentRuntime:
     async def call_tool(
         self, name: str, arguments: dict, *, consumer_plugin: str = '', context: dict | None = None,
     ) -> dict | None:
-        agent_result = await self.service.call_agent_tool(
+        model_tool_result = await self.service.call_model_tool(
             name, arguments, consumer_plugin=consumer_plugin, context=context,
         )
-        if agent_result is not None:
-            return agent_result
+        if model_tool_result is not None:
+            return model_tool_result
         if name == 'load_skill':
             return self.load_skill(str(arguments.get('skill_id') or ''))
         if name == 'load_plugin_skill' and consumer_plugin:
@@ -668,7 +670,10 @@ class AgentRuntime:
                 job_id = str(job.get('id') or '')
                 due = False
                 interval = int(job.get('interval_seconds') or 0)
-                if interval > 0:
+                run_at = int(job.get('run_at') or 0)
+                if run_at > 0:
+                    due = now >= run_at and job_id not in self._cron_seen
+                elif interval > 0:
                     due = now - self._cron_seen.get(job_id, 0) >= max(60, interval)
                 elif job.get('cron'):
                     fields = str(job['cron']).split()
@@ -689,7 +694,26 @@ class AgentRuntime:
                 provider_id=str(job.get('provider_id') or ''),
                 model=str(job.get('model') or ''),
                 session_id=f"cron:{job.get('id')}",
+                tool_context={'cron_job': copy.deepcopy(job)},
             )
+            target_type = str(job.get('target_type') or '')
+            target_id = str(job.get('target_id') or '')
+            if target_type and target_id:
+                from core.bot.manager import _bot_manager_ref
+                bot = _bot_manager_ref.get_bot(job.get('appid')) if _bot_manager_ref else None
+                sender = getattr(bot, 'sender', None)
+                text = str(result.get('text') or '').strip()
+                if sender is None:
+                    raise RuntimeError('定时任务对应的机器人当前不在线')
+                if text:
+                    if target_type == 'group':
+                        creator = str(job.get('creator_user_id') or '')
+                        content = f'<@{creator}> {text}' if creator else text
+                        await sender.send_to_group(target_id, content)
+                    elif target_type == 'direct':
+                        await sender.send_to_user(target_id, text)
+                    elif target_type == 'channel':
+                        await sender.send_to_channel(target_id, text)
             if self._emit:
                 await self._emit('ai_cron_result', {
                     'job_id': job.get('id'), 'name': job.get('name'), 'result': result,
@@ -699,3 +723,7 @@ class AgentRuntime:
                 await self._emit('ai_cron_result', {
                     'job_id': job.get('id'), 'name': job.get('name'), 'error': _redact(error),
                 })
+        finally:
+            if job.get('one_shot'):
+                await self.service.consume_one_shot_task(job.get('id'))
+                self._cron_seen.pop(str(job.get('id') or ''), None)
