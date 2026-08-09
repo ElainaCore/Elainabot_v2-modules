@@ -16,6 +16,7 @@ from xml.etree import ElementTree
 
 import aiohttp
 
+from .agent_store import AgentStore
 from .audit import InvocationAudit
 from .runtime import AgentRuntime
 
@@ -351,7 +352,6 @@ DEFAULT_CONFIG = {
         'timeout': 30,
         'execution_timeout': 20,
     },
-    'subagents': [],
     'plugin_capabilities': [],
     'cron_jobs': [],
     'providers': [
@@ -500,22 +500,6 @@ def normalize_config(value: dict | None) -> dict:
         'timeout': min(120, max(5, int(sandbox.get('timeout', 30)))),
         'execution_timeout': min(60, max(1, int(sandbox.get('execution_timeout', 20)))),
     }
-    subagents = []
-    for raw in result.get('subagents', []) if isinstance(result.get('subagents'), list) else []:
-        if not isinstance(raw, dict):
-            continue
-        agent_id = str(raw.get('id') or uuid.uuid4().hex[:8]).strip()[:64]
-        if agent_id:
-            subagents.append({
-                'id': agent_id,
-                'name': str(raw.get('name') or agent_id).strip()[:100],
-                'description': str(raw.get('description') or '').strip()[:500],
-                'system_prompt': str(raw.get('system_prompt') or '')[:30000],
-                'provider_id': str(raw.get('provider_id') or '').strip()[:128],
-                'model': str(raw.get('model') or '').strip()[:256],
-                'enabled': bool(raw.get('enabled', True)),
-            })
-    result['subagents'] = subagents[:50]
     capabilities = []
     seen_capabilities = set()
     for raw in result.get('plugin_capabilities', []) if isinstance(result.get('plugin_capabilities'), list) else []:
@@ -538,7 +522,7 @@ def normalize_config(value: dict | None) -> dict:
             'name': str(raw.get('name') or capability_id).strip()[:100],
             'description': str(raw.get('description') or '').strip()[:500],
             'enabled': bool(raw.get('enabled', True)),
-            'shared': bool(raw.get('shared', kind == 'tool')),
+            'shared': bool(raw.get('shared', kind in {'tool', 'agent'})),
             'allowed_consumers': list(dict.fromkeys(
                 str(item).strip()[:128]
                 for item in raw.get('allowed_consumers', [])
@@ -578,6 +562,7 @@ class AIService:
         self._health: dict[tuple[str, str], dict] = {}
         self._capability_handlers: dict[str, ToolHandler] = {}
         self._online_capabilities: set[str] = set()
+        self.agent_store = AgentStore(data_dir or '.')
         for provider in self._config.get('providers', []):
             for model, health in (provider.get('health') or {}).items():
                 if isinstance(health, dict):
@@ -637,7 +622,7 @@ class AIService:
                 incoming['shared'] = bool(current.get('shared'))
                 incoming['shared_configured'] = True
             else:
-                incoming['shared'] = capability_kind == 'tool'
+                incoming['shared'] = capability_kind in {'tool', 'agent'}
                 incoming['shared_configured'] = False
             records = [
                 incoming if item.get('key') == key else item
@@ -645,7 +630,7 @@ class AIService:
             ]
         else:
             incoming.setdefault('enabled', True)
-            incoming.setdefault('shared', capability_kind == 'tool')
+            incoming.setdefault('shared', capability_kind in {'tool', 'agent'})
             incoming.setdefault('shared_configured', False)
             records = [*self._config.get('plugin_capabilities', []), incoming]
         merged = copy.deepcopy(self._config)
@@ -689,6 +674,57 @@ class AIService:
 
     def capability_handler(self, key: str):
         return self._capability_handlers.get(str(key or ''))
+
+    def agent_catalog(self, consumer_plugin: str = '') -> list[dict]:
+        result = [
+            {**item, 'key': f"file:{item['id']}", 'online': True}
+            for item in self.agent_store.catalog()
+        ]
+        if consumer_plugin:
+            for item in self.plugin_capabilities(consumer_plugin=consumer_plugin, kind='agent'):
+                if item.get('online'):
+                    result.append({
+                        'id': item['key'], 'key': f"plugin:{item['key']}",
+                        'name': item.get('name') or item['id'],
+                        'description': item.get('description') or '',
+                        'kind': 'plugin', 'online': True,
+                    })
+        return result
+
+    def agent_tools(self, enabled_ids: list[str] | None = None, consumer_plugin: str = '') -> list[dict]:
+        selected = set(str(item) for item in (enabled_ids or []))
+        result = []
+        for item in self.agent_store.catalog():
+            if not selected or f"file:{item['id']}" in selected:
+                result.extend([tool for tool in self.agent_store.tools()
+                               if tool['function']['name'] == self.agent_store.tool_name(item['id'])])
+        if consumer_plugin:
+            for item in self.plugin_capabilities(consumer_plugin=consumer_plugin, kind='agent'):
+                if f"plugin:{item['key']}" not in selected or not item.get('online'):
+                    continue
+                name = re.sub(r'[^A-Za-z0-9_-]+', '_', f"agent_plugin_{item['source_plugin']}_{item['id']}")[:64]
+                result.append({'type': 'function', 'function': {
+                    'name': name, 'description': item.get('description') or item.get('name') or name,
+                    'parameters': {'type': 'object', 'properties': {'task': {'type': 'string'}}, 'required': ['task']},
+                }})
+        return result
+
+    async def call_agent_tool(self, name: str, arguments: dict, *, consumer_plugin: str = '', context: dict | None = None):
+        value = await self.agent_store.call(name, arguments, context)
+        if value is not None:
+            return value
+        for item in self.plugin_capabilities(consumer_plugin=consumer_plugin, kind='agent') if consumer_plugin else []:
+            tool_name = re.sub(r'[^A-Za-z0-9_-]+', '_', f"agent_plugin_{item['source_plugin']}_{item['id']}")[:64]
+            if tool_name != name or not item.get('online'):
+                continue
+            handler = self.capability_handler(item['key'])
+            if handler is not None:
+                value = handler(item['id'], arguments)
+                return await value if asyncio.iscoroutine(value) else value
+            return await self.runtime._delegate_plugin_agent({
+                'capability_key': item['key'], 'task': str(arguments.get('task') or '')[:12000],
+            }, consumer_plugin)
+        return None
 
     def list_capabilities(self, consumer_plugin: str, kind: str = '') -> list[dict]:
         """List online capabilities that a plugin may discover and call."""
@@ -1422,6 +1458,7 @@ class AIService:
         required_tools: list[str] | None = None,
         prepare_context: bool = True,
         completion_validator: CompletionValidator | None = None,
+        tool_context: dict | None = None,
     ) -> dict:
         if not self._config['enabled']:
             raise AIServiceError('AI LLM 服务未启用')
@@ -1470,7 +1507,7 @@ class AIService:
                         result = await value if asyncio.iscoroutine(value) else value
                     else:
                         result = await self.runtime.call_tool(
-                            name, arguments, consumer_plugin=consumer_plugin,
+                            name, arguments, consumer_plugin=consumer_plugin, context=tool_context,
                         )
                         if result is None and tool_handler is None:
                             result = {'ok': False, 'error': '工具不可用'}

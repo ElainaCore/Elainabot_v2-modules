@@ -335,23 +335,8 @@ class AgentRuntime:
                     },
                 },
             })
-        agents = [item for item in config.get('subagents', []) if item.get('enabled')]
-        if allow_type('agent') and allow_handoff and config.get('agent_enabled') and agents:
-            result.append({
-                'type': 'function',
-                'function': {
-                    'name': 'delegate_to_agent',
-                    'description': '把明确、独立的子任务交给最合适的子代理执行。',
-                    'parameters': {
-                        'type': 'object',
-                        'properties': {
-                            'agent_id': {'type': 'string', 'enum': [item['id'] for item in agents]},
-                            'task': {'type': 'string'},
-                        },
-                        'required': ['agent_id', 'task'],
-                    },
-                },
-            })
+        if allow_type('agent') and config.get('agent_enabled'):
+            result.extend(self.service.agent_store.tools())
         sandbox = config.get('sandbox', {})
         if allow_type('tool') and sandbox.get('enabled') and sandbox.get('endpoint'):
             result.append({
@@ -460,12 +445,15 @@ class AgentRuntime:
         return result
 
     async def call_tool(
-        self, name: str, arguments: dict, *, consumer_plugin: str = '',
+        self, name: str, arguments: dict, *, consumer_plugin: str = '', context: dict | None = None,
     ) -> dict | None:
+        agent_result = await self.service.call_agent_tool(
+            name, arguments, consumer_plugin=consumer_plugin, context=context,
+        )
+        if agent_result is not None:
+            return agent_result
         if name == 'load_skill':
             return self.load_skill(str(arguments.get('skill_id') or ''))
-        if name == 'delegate_to_agent':
-            return await self._delegate(arguments)
         if name == 'sandbox_execute':
             return await self._sandbox(arguments)
         if name == 'load_plugin_skill' and consumer_plugin:
@@ -526,21 +514,6 @@ class AgentRuntime:
             consumer_plugin=consumer_plugin,
         )
         return {'ok': True, 'capability_key': key, 'text': result['text']}
-
-    async def _delegate(self, arguments: dict) -> dict:
-        config = self.service.config()
-        agent_id = str(arguments.get('agent_id') or '')
-        agent = next((item for item in config.get('subagents', []) if item.get('enabled') and item.get('id') == agent_id), None)
-        if agent is None:
-            return {'ok': False, 'error': '子代理不存在或未启用'}
-        result = await self.service.run_agent(
-            [{'role': 'user', 'content': str(arguments.get('task') or '')[:12000]}],
-            system_prompt=str(agent.get('system_prompt') or ''),
-            provider_id=str(agent.get('provider_id') or ''),
-            model=str(agent.get('model') or ''),
-            allow_handoff=False,
-        )
-        return {'ok': True, 'agent_id': agent_id, 'text': result['text']}
 
     async def _sandbox(self, arguments: dict) -> dict:
         config = self.service.config().get('sandbox', {})
