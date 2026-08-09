@@ -131,42 +131,58 @@ export function sectionPayload(section) {
   if (section === 'cron') return {cron_jobs: common.cron_jobs};
   return {};
 }
-export function renderCommon() {
-  ['enabled', 'agent_enabled', 'auto_switch', 'auto_fetch_models', 'audit_include_content'].forEach(key => $(key).checked = !!state[key]);
-  ['temperature', 'max_tokens', 'max_tool_rounds', 'request_timeout'].forEach(key => $(key).value = state[key] ?? '');
-  $('runtime_prompt').value = state.runtime_prompt || '';
-  $('context_max_tokens').value = state.context?.max_tokens ?? 65536;
-  $('context_max_turns').value = state.context?.max_turns ?? 30;
-  $('context_keep_ratio').value = state.context?.keep_recent_ratio ?? .25;
-  $('context_compress').checked = !!state.context?.compress_enabled;
-  $('skills_enabled').checked = !!state.skills?.enabled;
-  $('mcp_enabled').checked = !!state.mcp?.enabled;
-  $('sandbox_enabled').checked = !!state.sandbox?.enabled;
-  $('sandbox_endpoint').value = state.sandbox?.endpoint || '';
-  $('sandbox_token').value = state.sandbox?.token || '';
-  $('sandbox_exec_timeout').value = state.sandbox?.execution_timeout ?? 20;
-  $('agent-list').innerHTML = (state.subagents || []).map(agentTemplate).join('') || '<div class="empty">尚未配置子代理</div>';
-  $('mcp-list').innerHTML = (state.mcp?.servers || []).map(mcpTemplate).join('') || '<div class="empty">尚未配置 MCP Server</div>';
-  $('cron-list').innerHTML = (state.cron_jobs || []).map(cronTemplate).join('') || '<div class="empty">尚未配置计划任务</div>';
-  const enabled = (state.providers || []).filter(item => item.enabled);
-  $('m-providers').textContent = enabled.length;
-  $('m-models').textContent = enabled.reduce((sum, item) => sum + (item.models || []).filter(model => !(item.disabled_models || []).includes(model)).length, 0);
-  $('m-runs').textContent = state.runtime_status?.running ?? 0;
-  $('m-tools').textContent = state.runtime_status?.mcp_tools ?? 0;
-  $('skill-list').innerHTML = skills.length ? skills.map(item => '<label class="skill"><input type="checkbox" data-skill-id="' + esc(item.id) + '" ' + ((state.skills?.enabled_ids || []).includes(item.id) ? 'checked' : '') + '><span><b>' + esc(item.name) + '</b><small>' + esc(item.description) + '</small></span></label>').join('') : '<div class="empty">请将 Skill 放入 data/skills/&lt;id&gt;/SKILL.md</div>';
-  const capabilityKinds = {agent: 'plugin-agent-list', skill: 'plugin-skill-list', tool: 'plugin-tool-list', mcp: 'plugin-mcp-list'};
-  Object.entries(capabilityKinds).forEach(([kind, id]) => {
-    const items = (state.plugin_capabilities || []).filter(item => item.kind === kind);
-    $(id).innerHTML = items.map(capabilityTemplate).join('') || '<div class="empty">尚无插件注册此类能力</div>';
-  });
-  document.querySelectorAll('.capability-row').forEach(button => button.onclick = () => {
+function renderCapabilities(kind, id) {
+  const items = (state.plugin_capabilities || []).filter(item => item.kind === kind);
+  $(id).innerHTML = items.map(capabilityTemplate).join('') || '<div class="empty">尚无插件注册此类能力</div>';
+  $(id).querySelectorAll('.capability-row').forEach(button => button.onclick = () => {
     const card = button.closest('.capability-item');
     const expanded = !card.classList.toggle('collapsed');
     button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
   });
-  $('test-provider').innerHTML = providerOptions(state.active_provider);
-  $('test-provider').value = state.active_provider || '';
-  renderTestModels();
+}
+
+export function renderCommon(page = 'overview') {
+  if (page === 'overview') {
+    ['enabled', 'agent_enabled', 'auto_switch', 'auto_fetch_models', 'audit_include_content'].forEach(key => $(key).checked = !!state[key]);
+    ['temperature', 'max_tokens', 'max_tool_rounds', 'request_timeout'].forEach(key => $(key).value = state[key] ?? '');
+  }
+  const enabled = (state.providers || []).filter(item => item.enabled);
+  if (page === 'overview') {
+    $('m-providers').textContent = enabled.length;
+    $('m-models').textContent = enabled.reduce((sum, item) => sum + (item.models || []).filter(model => !(item.disabled_models || []).includes(model)).length, 0);
+    $('m-runs').textContent = state.runtime_status?.running ?? 0;
+    $('m-tools').textContent = state.runtime_status?.mcp_tools ?? 0;
+  } else if (page === 'context') {
+    $('runtime_prompt').value = state.runtime_prompt || '';
+    $('context_max_tokens').value = state.context?.max_tokens ?? 65536;
+    $('context_max_turns').value = state.context?.max_turns ?? 30;
+    $('context_keep_ratio').value = state.context?.keep_recent_ratio ?? .25;
+    $('context_compress').checked = !!state.context?.compress_enabled;
+  } else if (page === 'skills') {
+    $('skills_enabled').checked = !!state.skills?.enabled;
+    $('skill-list').innerHTML = skills.length ? skills.map(item => '<label class="skill"><input type="checkbox" data-skill-id="' + esc(item.id) + '" ' + ((state.skills?.enabled_ids || []).includes(item.id) ? 'checked' : '') + '><span><b>' + esc(item.name) + '</b><small>' + esc(item.description) + '</small></span></label>').join('') : '<div class="empty">请将 Skill 放入 data/skills/&lt;id&gt;/SKILL.md</div>';
+    renderCapabilities('skill', 'plugin-skill-list');
+  } else if (page === 'tools') {
+    renderCapabilities('tool', 'plugin-tool-list');
+  } else if (page === 'mcp') {
+    $('mcp_enabled').checked = !!state.mcp?.enabled;
+    $('mcp-list').innerHTML = (state.mcp?.servers || []).map(mcpTemplate).join('') || '<div class="empty">尚未配置 MCP Server</div>';
+    renderCapabilities('mcp', 'plugin-mcp-list');
+  } else if (page === 'sandbox') {
+    $('sandbox_enabled').checked = !!state.sandbox?.enabled;
+    $('sandbox_endpoint').value = state.sandbox?.endpoint || '';
+    $('sandbox_token').value = state.sandbox?.token || '';
+    $('sandbox_exec_timeout').value = state.sandbox?.execution_timeout ?? 20;
+  } else if (page === 'cron') {
+    $('cron-list').innerHTML = (state.cron_jobs || []).map(cronTemplate).join('') || '<div class="empty">尚未配置计划任务</div>';
+  } else if (page === 'agents') {
+    $('agent-list').innerHTML = (state.subagents || []).map(agentTemplate).join('') || '<div class="empty">尚未配置子代理</div>';
+    renderCapabilities('agent', 'plugin-agent-list');
+  } else if (page === 'test') {
+    $('test-provider').innerHTML = providerOptions(state.active_provider);
+    $('test-provider').value = state.active_provider || '';
+    renderTestModels();
+  }
 }
 export function renderTestModels() {
   const provider = (state.providers || []).find(item => item.id === $('test-provider').value);

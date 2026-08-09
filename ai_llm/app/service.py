@@ -691,8 +691,14 @@ class AIService:
             ))
         result = []
         for provider in providers:
-            if model and provider is primary:
-                models = [model]
+            if model:
+                disabled = set(provider.get('disabled_models', []))
+                catalog = {
+                    *(provider.get('models') or []),
+                    *(provider.get('model_priority') or []),
+                    provider.get('model'),
+                }
+                models = [model] if model in catalog and model not in disabled else []
             elif provider['model_priority_enabled'] and self._config['auto_switch']:
                 models = [
                     item for item in provider['model_priority']

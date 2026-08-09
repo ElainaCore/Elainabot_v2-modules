@@ -2,6 +2,9 @@ import { $, api, esc, state, toast } from './core.js';
 
 let records = [];
 let selectedRun = '';
+let currentPage = 1;
+let totalPages = 1;
+let totalRecords = 0;
 
 const fmtTime = value => value ? new Date(value * 1000).toLocaleString() : '-';
 const fmtMs = value => value == null ? '-' : (value >= 1000 ? `${(value / 1000).toFixed(2)}s` : `${value}ms`);
@@ -25,6 +28,24 @@ const endpointPath = value => {
 const badge = status => `<span class="log-status ${esc(status)}">${esc({ success: '成功', error: '失败', running: '运行中' }[status] || status || '未知')}</span>`;
 const section = (title, value) => `<details class="log-section"><summary>${esc(title)}</summary><pre>${esc(json(value))}</pre></details>`;
 
+function openDetail() {
+  const modal = $('log-modal');
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('log-modal-open');
+}
+
+function closeDetail(clearSelection = true) {
+  const modal = $('log-modal');
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+  document.body.classList.remove('log-modal-open');
+  if (clearSelection) {
+    selectedRun = '';
+    renderList();
+  }
+}
+
 function syncProviders() {
   const node = $('log-filter-provider');
   const selected = node.value;
@@ -36,6 +57,12 @@ function renderStats(stats = {}) {
   $('log-total').textContent = stats.total ?? 0;
   $('log-success-rate').textContent = `${stats.success_rate ?? 0}%`;
   $('log-average').textContent = fmtMs(stats.average_duration_ms ?? 0);
+}
+
+function renderPagination() {
+  $('log-page-info').textContent = '第 ' + currentPage + ' / ' + totalPages + ' 页，共 ' + totalRecords + ' 条';
+  $('log-prev').disabled = currentPage <= 1;
+  $('log-next').disabled = currentPage >= totalPages;
 }
 
 function renderList() {
@@ -79,17 +106,26 @@ function renderDetail(record) {
 export async function loadDetail(id) {
   selectedRun = id;
   renderList();
+  openDetail();
   $('log-detail').innerHTML = '<div class="empty">加载详情...</div>';
   try {
-    renderDetail(await api(`/logs?run_id=${encodeURIComponent(id)}`));
+    const record = await api(`/logs?run_id=${encodeURIComponent(id)}`);
+    if (selectedRun === id) renderDetail(record);
   } catch (error) {
-    toast(error.message, true);
+    if (selectedRun === id) {
+      closeDetail();
+      toast(error.message, true);
+    }
   }
 }
 
-export async function loadLogs(_first = false) {
+export async function loadLogs(resetPage = false) {
+  if (resetPage) currentPage = 1;
   syncProviders();
-  const query = new URLSearchParams({ limit: '200' });
+  const query = new URLSearchParams({
+    page: String(currentPage),
+    page_size: $('log-page-size').value || '20',
+  });
   const status = $('log-filter-status').value;
   const provider = $('log-filter-provider').value;
   const search = $('log-search').value.trim();
@@ -98,20 +134,40 @@ export async function loadLogs(_first = false) {
   if (search) query.set('search', search);
   const data = await api(`/logs?${query}`);
   records = data.items || [];
+  currentPage = Number(data.page || 1);
+  totalPages = Number(data.pages || 1);
+  totalRecords = Number(data.total || 0);
+  selectedRun = '';
+  closeDetail(false);
   renderStats(data.stats || {});
   renderList();
-  if (selectedRun && records.some(item => item.run_id === selectedRun)) await loadDetail(selectedRun);
-  else { selectedRun = ''; renderDetail(null); }
+  renderPagination();
 }
 
 export function bindLogs() {
+  $('log-modal-close').onclick = () => closeDetail();
+  $('log-modal-scrim').onclick = () => closeDetail();
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && $('log-modal').classList.contains('open')) closeDetail();
+  });
   $('log-refresh').onclick = () => loadLogs().catch(error => toast(error.message, true));
+  $('log-prev').onclick = () => {
+    if (currentPage <= 1) return;
+    currentPage -= 1;
+    loadLogs().catch(error => toast(error.message, true));
+  };
+  $('log-next').onclick = () => {
+    if (currentPage >= totalPages) return;
+    currentPage += 1;
+    loadLogs().catch(error => toast(error.message, true));
+  };
+  $('log-page-size').onchange = () => loadLogs(true).catch(error => toast(error.message, true));
   $('log-clear').onclick = async () => {
     if (!confirm('确定清空全部 AI LLM 调用日志？')) return;
     try {
       await api('/logs', { method: 'DELETE' });
       selectedRun = '';
-      await loadLogs();
+      await loadLogs(true);
       toast('调用日志已清空');
     } catch (error) {
       toast(error.message, true);

@@ -5,14 +5,17 @@ import {
 import { bindProviders, renderProviders } from './providers.js';
 import { bindLogs, loadLogs } from './logs.js';
 
-function renderAll() {
-  renderCommon();
-  renderProviders(renderAll, loadAll);
+const pages = new Set([...document.querySelectorAll('.nav button')].map(button => button.dataset.page));
+let activePage = 'overview';
+
+function renderPage(page = activePage) {
+  if (page === 'providers') renderProviders(renderPage, loadAll);
+  else if (page !== 'logs') renderCommon(page);
   bindItems();
 }
 async function loadAll() {
   await loadConfig();
-  renderAll();
+  renderPage();
 }
 function bindItems() {
   document.querySelectorAll('.remove-item').forEach(button => {
@@ -21,18 +24,29 @@ function bindItems() {
 }
 function addItem(key, value) {
   setState({...state, [key]: [...(state[key] || []), value]});
-  renderAll();
+  renderPage();
 }
-function showPage(page) {
-  document.querySelectorAll('.nav button').forEach(button => button.classList.toggle('active', button.dataset.page === page));
-  document.querySelectorAll('.page').forEach(section => section.classList.toggle('active', section.id === 'page-' + page));
+function pageFromLocation() {
+  const value = location.hash.startsWith('#') ? location.hash.slice(1) : location.hash;
+  return pages.has(value) ? value : 'overview';
+}
+function showPage(page, loadPageData = true) {
+  activePage = pages.has(page) ? page : 'overview';
+  document.querySelectorAll('.nav button').forEach(button => button.classList.toggle('active', button.dataset.page === activePage));
+  document.querySelectorAll('.page').forEach(section => section.classList.toggle('active', section.id === 'page-' + activePage));
   const active = document.querySelector('.nav button.active');
-  $('page-title').textContent = active ? active.textContent.trim() : page;
+  $('page-title').textContent = active ? active.textContent.trim() : activePage;
+  renderPage(activePage);
   if (window.matchMedia('(max-width: 600px)').matches) $('app').classList.add('sidebar-collapsed');
-  if (page === 'logs') loadLogs().catch(error => toast(error.message, true));
+  if (activePage === 'logs' && loadPageData) loadLogs().catch(error => toast(error.message, true));
 }
 
-document.querySelectorAll('.nav button').forEach(button => button.onclick = () => showPage(button.dataset.page));
+document.querySelectorAll('.nav button').forEach(button => button.onclick = () => {
+  const target = button.dataset.page;
+  if (target === activePage) showPage(target);
+  else location.hash = target;
+});
+window.addEventListener('hashchange', () => showPage(pageFromLocation()));
 $('sidebar-toggle').onclick = () => {
   const collapsed = $('app').classList.toggle('sidebar-collapsed');
   $('sidebar-toggle').textContent = collapsed ? '+' : '≡';
@@ -41,15 +55,18 @@ $('sidebar-toggle').onclick = () => {
   localStorage.setItem('ai-sidebar-collapsed', collapsed ? '1' : '0');
 };
 if (localStorage.getItem('ai-sidebar-collapsed') === '1') $('sidebar-toggle').click();
-$('reload').onclick = () => loadAll().then(() => toast('已刷新')).catch(error => toast(error.message, true));
+$('reload').onclick = () => loadAll().then(async () => {
+  if (activePage === 'logs') await loadLogs();
+  toast('已刷新');
+}).catch(error => toast(error.message, true));
 document.querySelectorAll('.save-section').forEach(button => button.onclick = () =>
-  saveConfigSection(button.dataset.section).then(() => { renderAll(); toast('配置已保存'); }).catch(error => toast(error.message, true))
+  saveConfigSection(button.dataset.section).then(() => { renderPage(); toast('配置已保存'); }).catch(error => toast(error.message, true))
 );
 $('add-provider').onclick = () => addItem('providers', {id: 'provider-' + Date.now(), name: '新接口', base_url: 'https://api.openai.com/v1', api_key: '', model: 'gpt-4o-mini', models: ['gpt-4o-mini'], model_priority: ['gpt-4o-mini'], disabled_models: [], model_priority_enabled: true, priority: 50, enabled: true});
 $('add-agent').onclick = () => addItem('subagents', {id: 'agent-' + Date.now(), name: '新子代理', description: '', system_prompt: '', provider_id: '', model: '', enabled: true});
 $('add-mcp').onclick = () => {
   setState({...state, mcp: {...state.mcp, servers: [...(state.mcp?.servers || []), {id: 'mcp-' + Date.now(), name: '新 MCP', endpoint: '', headers: {}, timeout: 20, enabled: true}]}});
-  renderAll();
+  renderPage();
 };
 $('add-cron').onclick = () => addItem('cron_jobs', {id: 'cron-' + Date.now(), name: '新任务', cron: '', interval_seconds: 3600, prompt: '', provider_id: '', model: '', enabled: true});
 $('refresh-mcp').onclick = async () => {
@@ -61,7 +78,7 @@ document.querySelectorAll('.save-plugin-capabilities').forEach(button => button.
   try {
     const data = await api('/plugin-capabilities', {method: 'PUT', body: JSON.stringify({items: readPluginCapabilities()})});
     setState({...state, plugin_capabilities: data.items || []});
-    renderAll();
+    renderPage();
     toast('插件能力设置已保存');
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
@@ -95,4 +112,6 @@ $('interrupt-test').onclick = async () => {
   catch (error) { toast(error.message, true); }
 };
 bindLogs();
-loadAll().catch(error => toast(error.message, true));
+activePage = pageFromLocation();
+if (!location.hash) history.replaceState(null, '', '#overview');
+loadAll().then(() => showPage(activePage, true)).catch(error => toast(error.message, true));

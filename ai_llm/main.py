@@ -272,18 +272,21 @@ async def _logs(request):
             return web.json_response({'success': False, 'error': '调用日志不存在'}, status=404)
         return web.json_response({'success': True, 'data': value})
     try:
-        limit = int(request.query.get('limit') or 100)
+        page = int(request.query.get('page') or 1)
+        page_size = int(request.query.get('page_size') or 20)
     except ValueError:
-        limit = 100
-    values = _service().audit.list(
-        limit=limit,
+        page, page_size = 1, 20
+    result = _service().audit.page(
+        page=page,
+        page_size=page_size,
         status=str(request.query.get('status') or ''),
         provider=str(request.query.get('provider') or ''),
         search=str(request.query.get('search') or ''),
     )
+    result['stats'] = _service().audit.stats()
     return web.json_response({
         'success': True,
-        'data': {'items': values, 'stats': _service().audit.stats()},
+        'data': result,
     })
 
 

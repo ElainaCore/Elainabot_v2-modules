@@ -227,7 +227,11 @@ class InvocationAudit:
             record['tokens_per_second'] = round(completion_tokens / (generation_ms / 1000), 2)
         self._save()
 
-    def list(self, *, limit: int = 100, status: str = '', provider: str = '', search: str = '') -> list[dict]:
+    def page(
+        self, *, page: int = 1, page_size: int = 20,
+        status: str = '', provider: str = '', search: str = '',
+    ) -> dict:
+        """Return one filtered summary page without exposing complete log records."""
         values = list(reversed(self._records))
         if status:
             values = [item for item in values if item.get('status') == status]
@@ -239,7 +243,24 @@ class InvocationAudit:
         if search:
             needle = search.lower()
             values = [item for item in values if needle in json.dumps(item, ensure_ascii=False).lower()]
-        return [self._summary(item) for item in values[:max(1, min(int(limit), 500))]]
+        size = max(1, min(int(page_size), 100))
+        total = len(values)
+        pages = max(1, (total + size - 1) // size)
+        current = max(1, min(int(page), pages))
+        start = (current - 1) * size
+        return {
+            'items': [self._summary(item) for item in values[start:start + size]],
+            'page': current,
+            'page_size': size,
+            'pages': pages,
+            'total': total,
+        }
+
+    def list(self, *, limit: int = 100, status: str = '', provider: str = '', search: str = '') -> list[dict]:
+        """Compatibility wrapper for callers that still request a bounded list."""
+        return self.page(
+            page=1, page_size=limit, status=status, provider=provider, search=search,
+        )['items']
 
     def get(self, run_id: str) -> dict | None:
         value = self._find(run_id)

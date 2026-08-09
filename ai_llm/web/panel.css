@@ -37,6 +37,39 @@ html,body{background:var(--host-bg);color:var(--host-text)}
 .log-traffic{min-width:86px;white-space:nowrap}.log-traffic span{color:var(--host-text2)}
 .log-latency{min-width:115px;padding-left:10px;border-left:4px solid var(--host-success);white-space:nowrap}.log-latency.error{border-left-color:var(--host-danger)}.log-latency span{color:var(--host-success)}.log-latency.error span{color:var(--host-danger)}.log-latency small{margin-top:4px;color:var(--host-text3)}
 .log-tools{text-align:center}.log-tools b{font-size:13px}.log-time{min-width:150px;color:var(--host-text2);white-space:nowrap}.log-table .empty{height:110px;border:0}
+.log-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px;color:var(--host-text3);font-size:10px}.log-pagination label{display:flex;align-items:center;gap:6px}.log-pagination select{height:34px;padding:0 8px;border:1px solid var(--host-border);border-radius:7px;background:var(--host-bg2);color:var(--host-text)}
 .log-detail{margin-top:12px;max-height:620px;overflow:auto;padding:13px;border:1px solid var(--host-border);border-radius:8px;background:var(--host-bg3)}
 .attempt{padding:0;overflow:hidden}.attempt>summary{padding:11px;cursor:pointer;list-style:none;align-items:center;justify-content:flex-start}.attempt>summary::-webkit-details-marker{display:none}.attempt>summary::before{content:'+';flex:0 0 auto;margin-right:7px;color:var(--host-text3)}.attempt[open]>summary::before{content:'−'}.attempt-head .log-status{margin-left:auto}.attempt-body{padding:0 11px 11px}
-@media (max-width:600px){.log-table{min-width:980px}.log-table td{height:68px;padding:9px}.log-detail{max-height:none;padding:9px}}
+@media (max-width:600px){.log-table{min-width:980px}.log-table td{height:68px;padding:9px}.log-pagination{align-items:flex-start;flex-direction:column}.log-detail{max-height:none;padding:9px}}
+
+/* Compact log page and on-demand full-detail modal. */
+#page-logs .metrics{gap:8px;margin-bottom:10px}
+#page-logs .metric{padding:10px 12px}
+#page-logs .metric span{font-size:10px}
+#page-logs .metric b{margin-top:2px;font-size:18px}
+#page-logs .panel{margin-bottom:10px}
+#page-logs .panel-head{min-height:44px;padding:7px 12px}
+#page-logs .panel-body{padding:10px 12px}
+#page-logs .btn{min-height:31px;padding:5px 9px;font-size:10px}
+#page-logs .log-filters{grid-template-columns:125px 150px minmax(200px,1fr);gap:7px;margin-bottom:8px}
+#page-logs .log-filters input,#page-logs .log-filters select{height:32px;padding:0 8px;font-size:10px}
+#page-logs .log-table{min-width:920px;font-size:10px}
+#page-logs .log-table th{height:34px;padding:0 8px}
+#page-logs .log-table td{height:55px;padding:6px 8px}
+#page-logs .log-main{min-width:88px}
+#page-logs .log-main b{font-size:10px}
+#page-logs .log-main small,#page-logs .log-traffic small,#page-logs .log-tools small{margin-top:3px;font-size:8px}
+#page-logs .log-traffic{min-width:72px}
+#page-logs .log-latency{min-width:100px;padding-left:7px;border-left-width:3px}
+#page-logs .log-time{min-width:126px}
+#page-logs .log-pagination{margin-top:7px}
+#page-logs .log-pagination select{height:30px}
+.log-modal{position:fixed;inset:0;z-index:20;display:none;align-items:center;justify-content:center;padding:24px}
+.log-modal.open{display:flex}
+.log-modal-scrim{position:absolute;inset:0;width:100%;height:100%;border:0;background:rgba(18,22,31,.52);cursor:default}
+.log-modal-dialog{position:relative;width:min(960px,calc(100vw - 48px));max-height:calc(100vh - 48px);display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--host-border);border-radius:8px;background:var(--host-float);box-shadow:0 22px 60px rgba(0,0,0,.26)}
+.log-modal-head{min-height:46px;display:flex;align-items:center;justify-content:space-between;padding:6px 9px 6px 14px;border-bottom:1px solid var(--host-border)}
+.log-modal-head h2{margin:0;font-size:13px}
+.log-modal .log-detail{min-height:180px;max-height:none;margin:0;padding:13px;overflow:auto;border:0;border-radius:0;background:var(--host-bg2)}
+body.log-modal-open{overflow:hidden}
+@media (max-width:600px){.log-modal{padding:10px}.log-modal-dialog{width:calc(100vw - 20px);max-height:calc(100vh - 20px)}#page-logs .metrics{grid-template-columns:repeat(3,minmax(0,1fr))}#page-logs .metric{padding:8px}#page-logs .metric b{font-size:16px}#page-logs .log-filters{grid-template-columns:1fr}#page-logs .log-table{min-width:860px}}
