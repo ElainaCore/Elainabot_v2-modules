@@ -27,7 +27,7 @@ try {
 function requestUrl(path) { return new URL(path.startsWith('http') ? path : BASE + path, location.origin).toString(); }
 export async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  headers.set('Content-Type', 'application/json');
+  if (!(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const response = await fetch(requestUrl(path), {...options, headers, credentials: 'same-origin'});
   const raw = await response.text();
   let payload = {};
@@ -160,7 +160,7 @@ export function renderCommon(page = 'overview') {
     $('context_compress').checked = !!state.context?.compress_enabled;
   } else if (page === 'skills') {
     $('skills_enabled').checked = !!state.skills?.enabled;
-    $('skill-list').innerHTML = skills.length ? skills.map(item => '<label class="skill"><input type="checkbox" data-skill-id="' + esc(item.id) + '" ' + ((state.skills?.enabled_ids || []).includes(item.id) ? 'checked' : '') + '><span><b>' + esc(item.name) + '</b><small>' + esc(item.description) + '</small></span></label>').join('') : '<div class="empty">请将 Skill 放入 data/skills/&lt;id&gt;/SKILL.md</div>';
+    $('skill-list').innerHTML = skills.length ? skills.map(item => '<article class="skill"><input type="checkbox" data-skill-id="' + esc(item.id) + '" ' + ((state.skills?.enabled_ids || []).includes(item.id) ? 'checked' : '') + '><span><b>' + esc(item.name) + '</b><small>' + esc(item.description) + '</small><code>' + esc(item.id) + '</code></span><button class="btn danger delete-skill" data-delete-skill="' + esc(item.id) + '" type="button">删除</button></article>').join('') : '<div class="empty">暂无 Skill，可上传 SKILL.md 或 Skill 压缩包</div>';
     renderCapabilities('skill', 'plugin-skill-list');
   } else if (page === 'tools') {
     renderCapabilities('tool', 'plugin-tool-list');

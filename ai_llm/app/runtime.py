@@ -7,9 +7,12 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
+import tempfile
 import time
 import uuid
+import zipfile
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -17,6 +20,9 @@ import aiohttp
 _SKILL_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
 _TOOL_NAME = re.compile(r'[^A-Za-z0-9_-]+')
 _IP_TEXT = re.compile(r'(?<![\w:])(?:\d{1,3}\.){3}\d{1,3}(?![\w:])')
+_SKILL_UPLOAD_LIMIT = 5 * 1024 * 1024
+_SKILL_EXTRACT_LIMIT = 20 * 1024 * 1024
+_SKILL_FILE_LIMIT = 200
 
 
 class RuntimeCapabilityError(RuntimeError):
@@ -127,6 +133,116 @@ class AgentRuntime:
                 continue
             result.append({'id': skill_id, 'name': name, 'description': description})
         return result
+
+    def install_skill(self, filename: str, content: bytes, skill_id: str = '') -> dict:
+        """Install a SKILL.md or a safely-contained skill zip archive."""
+        if not content:
+            raise RuntimeCapabilityError('上传文件为空')
+        if len(content) > _SKILL_UPLOAD_LIMIT:
+            raise RuntimeCapabilityError('Skill 文件不能超过 5 MB')
+        requested_id = str(skill_id or '').strip()
+        if requested_id and not _SKILL_ID.fullmatch(requested_id):
+            raise RuntimeCapabilityError('Skill ID 只能包含字母、数字、下划线和连字符')
+        name = os.path.basename(str(filename or ''))
+        suffix = os.path.splitext(name)[1].lower()
+        if suffix not in {'.md', '.zip'}:
+            raise RuntimeCapabilityError('仅支持 SKILL.md 或 .zip 压缩包')
+
+        staging_root = tempfile.mkdtemp(prefix='.skill-upload-', dir=self.skills_dir)
+        try:
+            staging = os.path.join(staging_root, 'content')
+            os.makedirs(staging, exist_ok=True)
+            if suffix == '.md':
+                try:
+                    content.decode('utf-8')
+                except UnicodeDecodeError as error:
+                    raise RuntimeCapabilityError('SKILL.md 必须使用 UTF-8 编码') from error
+                with open(os.path.join(staging, 'SKILL.md'), 'wb') as file:
+                    file.write(content)
+            else:
+                try:
+                    archive = zipfile.ZipFile(__import__('io').BytesIO(content))
+                except zipfile.BadZipFile as error:
+                    raise RuntimeCapabilityError('Skill 压缩包格式无效') from error
+                with archive:
+                    members = [item for item in archive.infolist() if not item.is_dir()]
+                    if not members or len(members) > _SKILL_FILE_LIMIT:
+                        raise RuntimeCapabilityError('Skill 压缩包文件数量无效或超过 200 个')
+                    if sum(item.file_size for item in members) > _SKILL_EXTRACT_LIMIT:
+                        raise RuntimeCapabilityError('Skill 解压后不能超过 20 MB')
+                    paths = []
+                    for item in members:
+                        normalized = item.filename.replace('\\', '/').strip('/')
+                        parts = [part for part in normalized.split('/') if part not in ('', '.')]
+                        if not parts or '..' in parts or os.path.isabs(item.filename):
+                            raise RuntimeCapabilityError('Skill 压缩包包含不安全路径')
+                        # Unix symlinks are not accepted.
+                        if (item.external_attr >> 16) & 0o170000 == 0o120000:
+                            raise RuntimeCapabilityError('Skill 压缩包不能包含符号链接')
+                        paths.append((item, parts))
+                    skill_files = [parts for _item, parts in paths if parts[-1].casefold() == 'skill.md']
+                    if len(skill_files) != 1:
+                        raise RuntimeCapabilityError('压缩包必须且只能包含一个 SKILL.md')
+                    root_parts = skill_files[0][:-1]
+                    for item, parts in paths:
+                        if parts[:len(root_parts)] != root_parts:
+                            raise RuntimeCapabilityError('压缩包文件必须位于 Skill 根目录内')
+                        relative = parts[len(root_parts):]
+                        if not relative:
+                            continue
+                        target = os.path.abspath(os.path.join(staging, *relative))
+                        if not target.startswith(os.path.abspath(staging) + os.sep):
+                            raise RuntimeCapabilityError('Skill 压缩包包含不安全路径')
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        with archive.open(item) as source, open(target, 'wb') as output:
+                            shutil.copyfileobj(source, output)
+
+            markdown = os.path.join(staging, 'SKILL.md')
+            try:
+                with open(markdown, encoding='utf-8') as file:
+                    head = file.read(8192)
+            except (OSError, UnicodeDecodeError) as error:
+                raise RuntimeCapabilityError('无法读取 UTF-8 格式的 SKILL.md') from error
+            derived = os.path.splitext(name)[0]
+            if head.startswith('---'):
+                end = head.find('\n---', 3)
+                for line in head[3:end if end >= 0 else 3].splitlines():
+                    key, separator, value = line.partition(':')
+                    if separator and key.strip() in {'id', 'name'}:
+                        candidate = value.strip().strip('\"\'')
+                        if _SKILL_ID.fullmatch(candidate):
+                            derived = candidate
+                            if key.strip() == 'id':
+                                break
+            final_id = requested_id or derived
+            if not _SKILL_ID.fullmatch(final_id):
+                raise RuntimeCapabilityError('请填写有效的 Skill ID')
+            destination = os.path.join(self.skills_dir, final_id)
+            if os.path.exists(destination):
+                raise RuntimeCapabilityError(f'Skill {final_id} 已存在，请先删除后再上传')
+            os.replace(staging, destination)
+            return next(item for item in self.skills() if item['id'] == final_id)
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+    async def delete_skill(self, skill_id: str) -> bool:
+        skill_id = str(skill_id or '').strip()
+        if not _SKILL_ID.fullmatch(skill_id):
+            raise RuntimeCapabilityError('Skill ID 无效')
+        target = os.path.abspath(os.path.join(self.skills_dir, skill_id))
+        if not target.startswith(self.skills_dir + os.sep) or not os.path.isdir(target):
+            return False
+        shutil.rmtree(target)
+        config = self.service.config()
+        enabled = config.get('skills', {}).get('enabled_ids', [])
+        if skill_id in enabled:
+            await self.service.save({
+                'skills': {
+                    **config.get('skills', {}),
+                    'enabled_ids': [item for item in enabled if item != skill_id],
+                },
+            })
+        return True
 
     def load_skill(self, skill_id: str) -> dict:
         enabled = set(self.service.config().get('skills', {}).get('enabled_ids', []))

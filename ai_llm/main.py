@@ -19,7 +19,7 @@ from .app.service import DEFAULT_CONFIG, AIService
 __module_meta__ = {
     'name': 'AI LLM 服务',
     'description': '统一管理 LLM、Agent、MCP、Skills、沙箱与计划任务',
-    'version': '1.0.1',
+    'version': '1.1.0',
     'author': 'ElainaBot',
 }
 
@@ -67,6 +67,8 @@ async def setup(ctx):
     register_route('POST', f'{PREFIX}/test', _test)
     register_route('GET', f'{PREFIX}/runtime', _runtime)
     register_route('GET', f'{PREFIX}/skills', _skills)
+    register_route('POST', f'{PREFIX}/skills', _upload_skill)
+    register_route('DELETE', f'{PREFIX}/skills', _delete_skill)
     register_route('PUT', f'{PREFIX}/plugin-capabilities', _save_plugin_capabilities)
     register_route('POST', f'{PREFIX}/mcp/refresh', _mcp_refresh)
     register_route('POST', f'{PREFIX}/interrupt', _interrupt)
@@ -103,6 +105,8 @@ async def teardown():
         ('POST', f'{PREFIX}/test'),
         ('GET', f'{PREFIX}/runtime'),
         ('GET', f'{PREFIX}/skills'),
+        ('POST', f'{PREFIX}/skills'),
+        ('DELETE', f'{PREFIX}/skills'),
         ('PUT', f'{PREFIX}/plugin-capabilities'),
         ('POST', f'{PREFIX}/mcp/refresh'),
         ('POST', f'{PREFIX}/interrupt'),
@@ -233,6 +237,46 @@ async def _runtime(_request):
 
 async def _skills(_request):
     return web.json_response({'success': True, 'data': _service().runtime.skills()})
+
+
+async def _upload_skill(request):
+    try:
+        reader = await request.multipart()
+        skill_id, filename, content = '', '', b''
+        async for part in reader:
+            if part.name == 'skill_id':
+                skill_id = (await part.text()).strip()
+            elif part.name == 'file':
+                filename = part.filename or ''
+                chunks = []
+                size = 0
+                while True:
+                    chunk = await part.read_chunk(64 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > 5 * 1024 * 1024:
+                        return web.json_response({
+                            'success': False, 'error': 'Skill 文件不能超过 5 MB',
+                        }, status=413)
+                    chunks.append(chunk)
+                content = b''.join(chunks)
+        if not filename:
+            return web.json_response({'success': False, 'error': '请选择 Skill 文件'}, status=400)
+        item = _service().runtime.install_skill(filename, content, skill_id)
+        return web.json_response({'success': True, 'data': item}, status=201)
+    except (ValueError, RuntimeError, OSError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=400)
+
+
+async def _delete_skill(request):
+    try:
+        deleted = await _service().runtime.delete_skill(request.query.get('skill_id', ''))
+        if not deleted:
+            return web.json_response({'success': False, 'error': 'Skill 不存在'}, status=404)
+        return web.json_response({'success': True, 'data': {'deleted': True}})
+    except (ValueError, RuntimeError, OSError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=400)
 
 
 async def _save_plugin_capabilities(request):

@@ -21,6 +21,19 @@ function bindItems() {
   document.querySelectorAll('.remove-item').forEach(button => {
     button.onclick = () => button.closest('.item').remove();
   });
+  document.querySelectorAll('.delete-skill').forEach(button => {
+    button.onclick = async () => {
+      const skillId = button.dataset.deleteSkill;
+      if (!confirm('确定删除 Skill “' + skillId + '”？此操作会删除其全部文件。')) return;
+      button.disabled = true;
+      try {
+        await api('/skills?skill_id=' + encodeURIComponent(skillId), {method: 'DELETE'});
+        await loadAll();
+        toast('Skill 已删除');
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    };
+  });
 }
 function addItem(key, value) {
   setState({...state, [key]: [...(state[key] || []), value]});
@@ -62,7 +75,24 @@ $('reload').onclick = () => loadAll().then(async () => {
 document.querySelectorAll('.save-section').forEach(button => button.onclick = () =>
   saveConfigSection(button.dataset.section).then(() => { renderPage(); toast('配置已保存'); }).catch(error => toast(error.message, true))
 );
-$('add-provider').onclick = () => addItem('providers', {id: 'provider-' + Date.now(), name: '新接口', base_url: 'https://api.openai.com/v1', api_key: '', model: 'gpt-4o-mini', models: ['gpt-4o-mini'], model_priority: ['gpt-4o-mini'], disabled_models: [], model_priority_enabled: true, priority: 50, enabled: true});
+$('add-provider').onclick = () => addItem('providers', {id: 'provider-' + Date.now(), name: '新接口', api_type: 'openai_compatible', base_url: '', api_key: '', model: '', models: [], model_priority: [], disabled_models: [], chat_path: '/chat/completions', models_path: '/models', image_path: '/images/generations', image_edit_path: '/images/edits', model_priority_enabled: true, priority: 50, enabled: true});
+$('skill-upload-form').onsubmit = async event => {
+  event.preventDefault();
+  const file = $('skill-file').files[0];
+  if (!file) return toast('请选择 Skill 文件', true);
+  const button = $('upload-skill');
+  const form = new FormData();
+  form.append('file', file, file.name);
+  form.append('skill_id', $('skill-upload-id').value.trim());
+  button.disabled = true;
+  try {
+    const item = await api('/skills', {method: 'POST', body: form});
+    $('skill-upload-form').reset();
+    await loadAll();
+    toast('Skill ' + item.id + ' 已上传');
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+};
 $('add-agent').onclick = () => addItem('subagents', {id: 'agent-' + Date.now(), name: '新子代理', description: '', system_prompt: '', provider_id: '', model: '', enabled: true});
 $('add-mcp').onclick = () => {
   setState({...state, mcp: {...state.mcp, servers: [...(state.mcp?.servers || []), {id: 'mcp-' + Date.now(), name: '新 MCP', endpoint: '', headers: {}, timeout: 20, enabled: true}]}});

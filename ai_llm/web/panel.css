@@ -72,4 +72,10 @@ html,body{background:var(--host-bg);color:var(--host-text)}
 .log-modal-head h2{margin:0;font-size:13px}
 .log-modal .log-detail{min-height:180px;max-height:none;margin:0;padding:13px;overflow:auto;border:0;border-radius:0;background:var(--host-bg2)}
 body.log-modal-open{overflow:hidden}
+.skill-upload{display:grid;grid-template-columns:minmax(220px,2fr) minmax(180px,1fr) auto;align-items:end;gap:10px;margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.skill-upload .btn{height:39px}
+.skill{display:grid;grid-template-columns:18px minmax(0,1fr) auto}
+.skill code{display:block;margin-top:5px;color:var(--muted);font-size:9px}
+.skill .btn{min-height:30px;padding:4px 8px}
+@media (max-width:600px){.skill-upload{grid-template-columns:1fr}}
 @media (max-width:600px){.log-modal{padding:10px}.log-modal-dialog{width:calc(100vw - 20px);max-height:calc(100vh - 20px)}#page-logs .metrics{grid-template-columns:repeat(3,minmax(0,1fr))}#page-logs .metric{padding:8px}#page-logs .metric b{font-size:16px}#page-logs .log-filters{grid-template-columns:1fr}#page-logs .log-table{min-width:860px}}

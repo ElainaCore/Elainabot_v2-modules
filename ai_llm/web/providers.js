@@ -1,6 +1,27 @@
 import { $, api, esc, orderedModels, setState, state, toast } from './core.js';
 
 const collapsed = new Set();
+const PROVIDER_TYPES = [
+  ['openai', 'OpenAI'], ['openai_compatible', 'OpenAI 兼容 / 中转'],
+  ['gemini', 'Gemini 原生'], ['gemini_openai', 'Gemini OpenAI 兼容'],
+  ['grok', 'Grok / xAI'], ['agnes', 'Agnes'], ['novelai', 'NovelAI'],
+  ['jimeng2api', 'Jimeng2API'], ['z_image_gitee', 'Z-Image Gitee'],
+];
+const TYPE_DEFAULTS = {
+  openai: {base_url: 'https://api.openai.com/v1'},
+  openai_compatible: {base_url: ''},
+  gemini: {base_url: 'https://generativelanguage.googleapis.com/v1beta'},
+  gemini_openai: {base_url: 'https://generativelanguage.googleapis.com/v1beta/openai'},
+  grok: {base_url: 'https://api.x.ai/v1'},
+  agnes: {base_url: ''},
+  novelai: {base_url: 'https://image.novelai.net', image_path: '/ai/generate-image'},
+  jimeng2api: {base_url: ''},
+  z_image_gitee: {base_url: ''},
+};
+
+function typeOptions(current) {
+  return PROVIDER_TYPES.map(([value, label]) => '<option value="' + value + '" ' + (value === current ? 'selected' : '') + '>' + label + '</option>').join('');
+}
 
 export function providerTemplate(provider) {
   const models = orderedModels(provider);
@@ -11,7 +32,7 @@ export function providerTemplate(provider) {
     return '<div class="model-row" draggable="true" data-model="' + esc(model) + '"><span class="handle">::</span><input class="model-enabled" type="checkbox" ' + (!(provider.disabled_models || []).includes(model) ? 'checked' : '') + '><span class="model-name" title="' + esc(model) + '">' + esc(model) + '</span><span class="rank">P' + (index + 1) + '</span><span class="health-dot' + dot + '" title="' + esc(result.error || (result.ok ? '可用' : '尚未测活')) + '"></span></div>';
   }).join('') : '<div class="empty">点击“获取模型”同步列表</div>';
   const apiKey = provider.api_key_set ? '********' : (provider.api_key || '');
-  return '<article class="provider' + (provider.id === state.active_provider ? ' active' : '') + (collapsed.has(provider.id) ? ' collapsed' : '') + '" data-provider-id="' + esc(provider.id) + '"><div class="provider-head"><div class="provider-title"><input type="radio" name="active-provider" ' + (provider.id === state.active_provider ? 'checked' : '') + '><strong>' + esc(provider.name || provider.id) + '</strong>' + (provider.builtin ? '<span class="tag">内置</span>' : '') + '</div><div class="actions"><button class="btn primary save-provider" type="button">保存接口</button><button class="btn fetch-models" type="button">获取模型</button><button class="btn probe-models" type="button">一键测活</button><button class="btn danger remove-provider" type="button">删除</button><button class="btn fold-provider" type="button" aria-label="展开或收起接口设置">' + (collapsed.has(provider.id) ? '+' : '-') + '</button></div></div><div class="provider-body"><div class="grid"><div class="field"><label>接口名称</label><input data-key="name" value="' + esc(provider.name) + '"></div><div class="field"><label>Base URL</label><input data-key="base_url" value="' + esc(provider.base_url) + '"></div><div class="field"><label>API Key</label><input data-key="api_key" data-key-set="' + (provider.api_key_set ? '1' : '0') + '" type="password" value="' + esc(apiKey) + '"></div><div class="field"><label>默认模型</label><input data-key="model" value="' + esc(provider.model) + '"></div><div class="field"><label>接口优先级</label><input data-key="priority" type="number" min="0" max="10000" value="' + (provider.priority ?? 100) + '"></div></div><div class="switches" style="margin-top:12px"><label class="switch compact"><span><b>启用接口</b></span><input data-key="enabled" type="checkbox" ' + (provider.enabled ? 'checked' : '') + '></label><label class="switch compact"><span><b>启用模型优先级</b></span><input data-key="model_priority_enabled" type="checkbox" ' + (provider.model_priority_enabled ? 'checked' : '') + '></label></div><div class="model-zone"><div class="model-toolbar"><span>模型优先级（拖动排序，关闭后自动跳过）</span><span class="health-summary"></span></div><div class="model-list">' + rows + '</div></div></div></article>';
+  return '<article class="provider' + (provider.id === state.active_provider ? ' active' : '') + (collapsed.has(provider.id) ? ' collapsed' : '') + '" data-provider-id="' + esc(provider.id) + '"><div class="provider-head"><div class="provider-title"><input type="radio" name="active-provider" ' + (provider.id === state.active_provider ? 'checked' : '') + '><strong>' + esc(provider.name || provider.id) + '</strong><span class="tag">' + esc((PROVIDER_TYPES.find(item => item[0] === provider.api_type) || ['', provider.api_type || 'OpenAI 兼容'])[1]) + '</span>' + (provider.builtin ? '<span class="tag">内置</span>' : '') + '</div><div class="actions"><button class="btn primary save-provider" type="button">保存接口</button><button class="btn fetch-models" type="button">获取模型</button><button class="btn probe-models" type="button">一键测活</button><button class="btn danger remove-provider" type="button">删除</button><button class="btn fold-provider" type="button" aria-label="展开或收起接口设置">' + (collapsed.has(provider.id) ? '+' : '-') + '</button></div></div><div class="provider-body"><div class="grid"><div class="field"><label>接口名称</label><input data-key="name" value="' + esc(provider.name) + '"></div><div class="field"><label>接口类型</label><select data-key="api_type" class="provider-type">' + typeOptions(provider.api_type || 'openai_compatible') + '</select></div><div class="field"><label>Base URL</label><input data-key="base_url" value="' + esc(provider.base_url) + '"></div><div class="field"><label>API Key</label><input data-key="api_key" data-key-set="' + (provider.api_key_set ? '1' : '0') + '" type="password" value="' + esc(apiKey) + '"></div><div class="field"><label>默认模型</label><input data-key="model" placeholder="输入模型名或点击获取模型" value="' + esc(provider.model) + '"></div><div class="field"><label>接口优先级</label><input data-key="priority" type="number" min="0" max="10000" value="' + (provider.priority ?? 100) + '"></div><div class="field"><label>模型列表路径</label><input data-key="models_path" value="' + esc(provider.models_path || '/models') + '"></div><div class="field"><label>对话路径</label><input data-key="chat_path" value="' + esc(provider.chat_path || '/chat/completions') + '"></div><div class="field"><label>生图路径</label><input data-key="image_path" value="' + esc(provider.image_path || '/images/generations') + '"></div></div><div class="switches" style="margin-top:12px"><label class="switch compact"><span><b>启用接口</b></span><input data-key="enabled" type="checkbox" ' + (provider.enabled ? 'checked' : '') + '></label><label class="switch compact"><span><b>启用模型优先级</b></span><input data-key="model_priority_enabled" type="checkbox" ' + (provider.model_priority_enabled ? 'checked' : '') + '></label></div><div class="model-zone"><div class="model-toolbar"><span>模型优先级（拖动排序，关闭后自动跳过）</span><span class="health-summary"></span></div><div class="model-list">' + rows + '</div></div></div></article>';
 }
 
 function providerFromCard(card) {
@@ -91,6 +112,12 @@ export function renderProviders(renderAll, loadAll) {
 }
 
 export function bindProviders(renderAll, loadAll) {
+  document.querySelectorAll('.provider-type').forEach(select => select.onchange = () => {
+    const defaults = TYPE_DEFAULTS[select.value] || {};
+    const card = select.closest('.provider');
+    if (defaults.base_url !== undefined) card.querySelector('[data-key="base_url"]').value = defaults.base_url;
+    if (defaults.image_path) card.querySelector('[data-key="image_path"]').value = defaults.image_path;
+  });
   document.querySelectorAll('.provider input[type=radio]').forEach(input => input.onchange = () => {
     const card = input.closest('.provider');
     setState({...state, active_provider: card.dataset.providerId});

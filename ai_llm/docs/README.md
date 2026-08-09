@@ -4,13 +4,13 @@ AI LLM 是 ElainaBot 的统一大模型服务模块。接口密钥、模型、�
 
 ## 优点
 
-- **统一管理接口**：集中配置 OpenAI 兼容接口和 API Key，插件不再重复保存密钥。
+- **统一管理接口**：集中配置 OpenAI、OpenAI 兼容中转、Gemini、Grok、Agnes、NovelAI、Jimeng2API、Z-Image Gitee 等接口和 API Key。
 - **自动获取模型**：可从接口同步模型列表，并保留已有模型的启用状态与优先级。
 - **双层优先级**：同时支持接口优先级和接口内模型优先级。
 - **自动故障切换**：当前模型或整个接口不可用时，可按优先级尝试下一个候选。
 - **流式响应**：支持 SSE 增量输出，适合聊天、开发助手和实时生成场景。
 - **统一 Agent 运行时**：支持工具调用、多轮工具执行、子代理、运行时 Prompt 和中断。
-- **Skills 与 MCP**：支持 Skills 按需加载，以及公网 HTTPS MCP 工具发现与调用。
+- **Skills 与 MCP**：支持从面板上传、启用和删除 Skills，并支持公网 HTTPS MCP 工具发现与调用。
 - **插件能力注入**：插件可以注册自己的 Skill、Agent、MCP 和工具，供 Agent 或其他插件调用。
 - **上下文控制**：支持会话标识、上下文裁剪和 Token 预算控制。
 - **调用可观测性**：统一记录模型、Token、首字延迟、总耗时、故障切换和工具调用。
@@ -20,9 +20,11 @@ AI LLM 是 ElainaBot 的统一大模型服务模块。接口密钥、模型、�
 
 1. 将 `ai_llm` 放入 ElainaBot 的模块目录。
 2. 在框架的模块管理中启用 **AI LLM**。
-3. 打开 AI LLM Web 面板，添加 OpenAI 兼容接口和 API Key。
+3. 打开 AI LLM Web 面板，选择接口类型并填写 Base URL、API Key 与模型。
 4. 获取模型，启用需要使用的模型并调整接口、模型优先级。
 5. 启用 **LLM 服务**；需要工具调用时同时启用 **Agent**。
+
+旧版接口配置会自动按“OpenAI 兼容 / 中转”读取。Gemini 原生类型会转换消息、工具调用和模型列表；其他 OpenAI 兼容类型可在面板覆盖模型、对话和生图路径。NovelAI 生图使用其原生请求与 ZIP 图片响应。Skills 页面支持上传 UTF-8 `SKILL.md` 或包含单个 `SKILL.md` 的 ZIP，单个上传文件最大 5 MB。
 
 插件不应自行保存大模型接口或密钥。需要让用户选择接口、模型时，应从 `service.config(public=True)` 返回的公开配置中生成选项。
 

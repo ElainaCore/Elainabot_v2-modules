@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import io
 import json
 import re
 import time
 import uuid
+import zipfile
 from collections.abc import AsyncIterator, Awaitable, Callable
+from urllib.parse import quote
 from xml.etree import ElementTree
 
 import aiohttp
@@ -175,6 +179,151 @@ def _tools_parameter_unsupported(error_text: str) -> bool:
     return tool_marker and unsupported
 
 
+PROVIDER_TYPES = {
+    'openai', 'openai_compatible', 'gemini', 'gemini_openai', 'grok',
+    'agnes', 'novelai', 'jimeng2api', 'z_image_gitee',
+}
+_PROVIDER_PATH_DEFAULTS = {
+    'chat_path': '/chat/completions',
+    'models_path': '/models',
+    'image_path': '/images/generations',
+    'image_edit_path': '/images/edits',
+}
+
+
+def _provider_endpoint(provider: dict, key: str, *, model: str = '') -> str:
+    base = str(provider.get('base_url') or '').rstrip('/')
+    if provider.get('api_type') == 'gemini' and key == 'chat_path':
+        return f"{base}/models/{quote(model, safe='')}:generateContent"
+    path = str(provider.get(key) or _PROVIDER_PATH_DEFAULTS[key]).strip()
+    return base + '/' + path.lstrip('/')
+
+
+def _provider_headers(provider: dict, *, content_type: str = '') -> dict:
+    headers = {'Accept': 'application/json'}
+    if content_type:
+        headers['Content-Type'] = content_type
+    api_key = str(provider.get('api_key') or '')
+    if api_key:
+        if provider.get('api_type') == 'gemini':
+            headers['x-goog-api-key'] = api_key
+        else:
+            headers['Authorization'] = f'Bearer {api_key}'
+    return headers
+
+
+def _message_text(content) -> str:
+    if isinstance(content, list):
+        return ''.join(
+            str(item.get('text') or '') for item in content
+            if isinstance(item, dict) and item.get('type') in {'text', 'input_text'}
+        )
+    return str(content or '')
+
+
+def _openai_to_gemini(payload: dict) -> dict:
+    contents, system_parts, call_names = [], [], {}
+    for message in payload.get('messages') or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get('role') or 'user')
+        if role == 'system':
+            text = _message_text(message.get('content'))
+            if text:
+                system_parts.append({'text': text})
+            continue
+        if role == 'assistant':
+            parts = []
+            text = _message_text(message.get('content'))
+            if text:
+                parts.append({'text': text})
+            for call in message.get('tool_calls') or []:
+                function = call.get('function') or {}
+                name = str(function.get('name') or '')
+                if not name:
+                    continue
+                try:
+                    arguments = json.loads(function.get('arguments') or '{}')
+                except (TypeError, json.JSONDecodeError):
+                    arguments = {}
+                call_names[str(call.get('id') or '')] = name
+                parts.append({'functionCall': {'name': name, 'args': arguments}})
+            if parts:
+                contents.append({'role': 'model', 'parts': parts})
+            continue
+        if role == 'tool':
+            name = str(message.get('name') or call_names.get(str(message.get('tool_call_id') or '')) or 'tool')
+            value = message.get('content')
+            try:
+                response = json.loads(value) if isinstance(value, str) else value
+            except json.JSONDecodeError:
+                response = {'result': str(value or '')}
+            if not isinstance(response, dict):
+                response = {'result': response}
+            contents.append({'role': 'user', 'parts': [{'functionResponse': {'name': name, 'response': response}}]})
+            continue
+        text = _message_text(message.get('content'))
+        if text:
+            contents.append({'role': 'user', 'parts': [{'text': text}]})
+    result = {
+        'contents': contents or [{'role': 'user', 'parts': [{'text': ''}]}],
+        'generationConfig': {
+            'temperature': payload.get('temperature'),
+            'maxOutputTokens': payload.get('max_tokens', payload.get('max_completion_tokens')),
+        },
+    }
+    result['generationConfig'] = {key: value for key, value in result['generationConfig'].items() if value is not None}
+    if system_parts:
+        result['systemInstruction'] = {'parts': system_parts}
+    declarations = []
+    for tool in payload.get('tools') or []:
+        function = tool.get('function') or {}
+        name = str(function.get('name') or '')
+        if name:
+            declarations.append({
+                'name': name,
+                'description': str(function.get('description') or ''),
+                'parameters': function.get('parameters') or {'type': 'object', 'properties': {}},
+            })
+    if declarations:
+        result['tools'] = [{'functionDeclarations': declarations}]
+        mode = 'ANY' if payload.get('tool_choice') == 'required' else 'AUTO'
+        result['toolConfig'] = {'functionCallingConfig': {'mode': mode}}
+    return result
+
+
+def _gemini_to_openai(payload: dict) -> dict:
+    candidates = payload.get('candidates') or []
+    parts = ((candidates[0].get('content') or {}).get('parts') or []) if candidates else []
+    text_parts, tool_calls = [], []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get('text') is not None:
+            text_parts.append(str(part.get('text') or ''))
+        call = part.get('functionCall')
+        if isinstance(call, dict) and call.get('name'):
+            tool_calls.append({
+                'id': f'gemini_{uuid.uuid4().hex}', 'type': 'function',
+                'function': {
+                    'name': str(call['name']),
+                    'arguments': json.dumps(call.get('args') or {}, ensure_ascii=False),
+                },
+            })
+    usage = payload.get('usageMetadata') or {}
+    message = {'role': 'assistant', 'content': ''.join(text_parts)}
+    if tool_calls:
+        message['tool_calls'] = tool_calls
+    return {
+        'choices': [{'index': 0, 'message': message, 'finish_reason': 'tool_calls' if tool_calls else 'stop'}],
+        'usage': {
+            'prompt_tokens': int(usage.get('promptTokenCount') or 0),
+            'completion_tokens': int(usage.get('candidatesTokenCount') or 0),
+            'total_tokens': int(usage.get('totalTokenCount') or 0),
+        },
+    }
+
+
 DEFAULT_CONFIG = {
     'enabled': True,
     'active_provider': 'ytea',
@@ -209,6 +358,7 @@ DEFAULT_CONFIG = {
         {
             'id': 'ytea',
             'name': 'YTea',
+            'api_type': 'openai_compatible',
             'base_url': 'https://api.ytea.top/v1',
             'api_key': '',
             'model': 'gpt-4.1-nano',
@@ -244,6 +394,8 @@ def normalize_config(value: dict | None) -> dict:
             continue
         seen.add(item['id'])
         item['name'] = str(item.get('name') or item['id']).strip()
+        api_type = str(item.get('api_type') or 'openai_compatible').strip().lower()
+        item['api_type'] = api_type if api_type in PROVIDER_TYPES else 'openai_compatible'
         item['base_url'] = str(item.get('base_url') or '').strip().rstrip('/')
         item['api_key'] = str(item.get('api_key') or '').strip()
         item['model'] = str(item.get('model') or '').strip()
@@ -251,6 +403,9 @@ def normalize_config(value: dict | None) -> dict:
         item['builtin'] = bool(item.get('builtin', False))
         item['priority'] = min(10000, max(0, int(item.get('priority', 100))))
         item['model_priority_enabled'] = bool(item.get('model_priority_enabled', True))
+        for key, default in _PROVIDER_PATH_DEFAULTS.items():
+            path = str(item.get(key) or default).strip()[:256]
+            item[key] = '/' + path.lstrip('/')
         models = item.get('models', [])
         if not isinstance(models, list):
             models = []
@@ -285,7 +440,7 @@ def normalize_config(value: dict | None) -> dict:
             }
         else:
             item['health'] = {}
-        if item['base_url'] and item['model']:
+        if item['base_url']:
             normalized.append(item)
     if not normalized:
         normalized = copy.deepcopy(DEFAULT_CONFIG['providers'])
@@ -717,22 +872,32 @@ class AIService:
         provider = self._provider(provider_id)
         if provider is None:
             raise AIServiceError('接口不存在或未启用')
-        headers = {'Accept': 'application/json'}
-        if provider.get('api_key'):
-            headers['Authorization'] = f"Bearer {provider['api_key']}"
+        headers = _provider_headers(provider)
         timeout = aiohttp.ClientTimeout(total=min(60, self._config['request_timeout']))
         async with (
             aiohttp.ClientSession(timeout=timeout) as session,
-            session.get(provider['base_url'] + '/models', headers=headers) as response,
+            session.get(_provider_endpoint(provider, 'models_path'), headers=headers) as response,
         ):
             raw = await response.text()
             if response.status < 200 or response.status >= 300:
                 raise AIServiceError(f'HTTP {response.status}: {raw[:200]}')
         try:
             payload = json.loads(raw)
-            models = sorted({str(item.get('id')).strip() for item in payload.get('data', []) if isinstance(item, dict) and item.get('id')})
+            if provider.get('api_type') == 'gemini':
+                rows = payload.get('models', [])
+                models = sorted({
+                    str(item.get('name')).removeprefix('models/').strip()
+                    for item in rows if isinstance(item, dict) and item.get('name')
+                    and 'generateContent' in item.get('supportedGenerationMethods', ['generateContent'])
+                })
+            else:
+                rows = payload.get('data', [])
+                models = sorted({
+                    str(item.get('id')).strip() for item in rows
+                    if isinstance(item, dict) and item.get('id')
+                })
         except (AttributeError, json.JSONDecodeError) as error:
-            raise AIServiceError('接口未返回 OpenAI 格式模型列表') from error
+            raise AIServiceError('接口未返回有效的模型列表') from error
         if not models:
             raise AIServiceError('接口未返回模型')
         async with self._lock:
@@ -819,10 +984,10 @@ class AIService:
         timeout = aiohttp.ClientTimeout(total=min(180, max(30, self._config['request_timeout'])))
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for provider, model in route:
-                headers = {'Accept': 'application/json'}
-                if provider.get('api_key'):
-                    headers['Authorization'] = f"Bearer {provider['api_key']}"
+                headers = _provider_headers(provider)
                 try:
+                    if provider.get('api_type') == 'novelai' and reference_image:
+                        raise AIProviderError('NovelAI 预设暂不支持参考图编辑')
                     if reference_image:
                         form = aiohttp.FormData()
                         form.add_field('model', model)
@@ -834,18 +999,52 @@ class AIService:
                             content_type='image/png',
                         )
                         request = session.post(
-                            provider['base_url'] + '/images/edits', headers=headers, data=form,
+                            _provider_endpoint(provider, 'image_edit_path'), headers=headers, data=form,
                         )
                     else:
+                        if provider.get('api_type') == 'novelai':
+                            width, height = (int(item) for item in image_size.split('x', 1))
+                            image_payload = {
+                                'input': value,
+                                'model': model,
+                                'action': 'generate',
+                                'parameters': {
+                                    'width': width, 'height': height, 'n_samples': 1,
+                                    'steps': 28, 'scale': 5, 'sampler': 'k_euler_ancestral',
+                                },
+                            }
+                        else:
+                            image_payload = {
+                                'model': model, 'prompt': value, 'size': image_size, 'n': 1,
+                            }
                         request = session.post(
-                            provider['base_url'] + '/images/generations',
+                            _provider_endpoint(provider, 'image_path'),
                             headers={**headers, 'Content-Type': 'application/json'},
-                            json={'model': model, 'prompt': value, 'size': image_size, 'n': 1},
+                            json=image_payload,
                         )
                     async with request as response:
-                        raw = await response.text()
                         if response.status < 200 or response.status >= 300:
+                            raw = await response.text()
                             raise AIProviderError(f'HTTP {response.status}: {raw[:200]}')
+                        content_type = response.headers.get('Content-Type', '').lower()
+                        if provider.get('api_type') == 'novelai' or 'application/zip' in content_type:
+                            binary = await response.read()
+                            try:
+                                with zipfile.ZipFile(io.BytesIO(binary)) as archive:
+                                    image_name = next(
+                                        name for name in archive.namelist()
+                                        if name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))
+                                    )
+                                    encoded = base64.b64encode(
+                                        archive.read(image_name)
+                                    ).decode('ascii')
+                            except (zipfile.BadZipFile, StopIteration, OSError) as error:
+                                raise AIProviderError('NovelAI 接口未返回有效的图片 ZIP') from error
+                            return {
+                                'url': '', 'b64_json': encoded, 'provider_id': provider['id'],
+                                'provider': provider.get('name') or provider['id'], 'model': model,
+                            }
+                        raw = await response.text()
                     payload = json.loads(raw)
                     item = (payload.get('data') or [])[0]
                     url = str(item.get('url') or '').strip()
@@ -932,9 +1131,14 @@ class AIService:
         return results
 
     async def _request(self, provider: dict, payload: dict, run_id: str = '') -> dict:
-        headers = {'Content-Type': 'application/json'}
-        if provider.get('api_key'):
-            headers['Authorization'] = f"Bearer {provider['api_key']}"
+        headers = _provider_headers(provider, content_type='application/json')
+        request_payload = (
+            _openai_to_gemini(payload)
+            if provider.get('api_type') == 'gemini' else payload
+        )
+        endpoint = _provider_endpoint(
+            provider, 'chat_path', model=str(payload.get('model') or ''),
+        )
         timeout = aiohttp.ClientTimeout(total=self._config['request_timeout'])
         attempt_id = self.audit.attempt_start(
             run_id, provider, str(payload.get('model') or ''), payload,
@@ -944,7 +1148,7 @@ class AIService:
             async with (
                 aiohttp.ClientSession(timeout=timeout) as session,
                 session.post(
-                    provider['base_url'] + '/chat/completions', headers=headers, json=payload
+                    endpoint, headers=headers, json=request_payload
                 ) as response,
             ):
                 first_byte_ms = round((time.perf_counter() - started) * 1000)
@@ -965,6 +1169,8 @@ class AIService:
             raise
         try:
             data = json.loads(raw)
+            if provider.get('api_type') == 'gemini':
+                data = _gemini_to_openai(data)
         except json.JSONDecodeError as error:
             if run_id:
                 self.audit.attempt_finish(
@@ -995,9 +1201,22 @@ class AIService:
             'max_tokens': self._config['max_tokens'] if max_tokens is None else max_tokens,
             'stream': True,
         }
-        headers = {'Content-Type': 'application/json', 'Accept': 'text/event-stream'}
-        if provider.get('api_key'):
-            headers['Authorization'] = f"Bearer {provider['api_key']}"
+        if provider.get('api_type') == 'gemini':
+            payload.pop('stream', None)
+            data = await self._request(provider, payload, run_id)
+            message = (data.get('choices') or [{}])[0].get('message') or {}
+            content = _message_text(message.get('content'))
+            if not content:
+                raise AIProviderError('Gemini 接口返回了空消息')
+            yield {
+                'type': 'meta', 'provider_id': provider['id'],
+                'provider_name': provider['name'], 'model': model,
+            }
+            yield {'type': 'delta', 'text': content}
+            yield {'type': 'done', 'usage': data.get('usage') or {}}
+            return
+        headers = _provider_headers(provider, content_type='application/json')
+        headers['Accept'] = 'text/event-stream'
         timeout = aiohttp.ClientTimeout(total=self._config['request_timeout'])
 
         for attempt in range(2):
@@ -1005,7 +1224,7 @@ class AIService:
             request_started = time.perf_counter()
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
-                    provider['base_url'] + '/chat/completions',
+                    _provider_endpoint(provider, 'chat_path', model=model),
                     headers=headers,
                     json=payload,
                 ) as response:
