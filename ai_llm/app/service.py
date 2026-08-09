@@ -16,10 +16,23 @@ from .audit import InvocationAudit
 from .runtime import AgentRuntime
 
 ToolHandler = Callable[[str, dict], Awaitable[dict] | dict]
+CompletionValidator = Callable[[str, list[dict]], str | None]
 
 
 class AIServiceError(RuntimeError):
     pass
+
+
+class AIProviderError(AIServiceError):
+    """A provider transport or protocol failure eligible for failover."""
+
+    pass
+
+
+class AIExecutionIncomplete(AIServiceError):
+    """The provider answered, but an agent task did not finish its required actions."""
+
+    execution_incomplete = True
 
 
 def _xml_scalar(value: str):
@@ -124,6 +137,44 @@ def _xml_tool_calls(content: str, tools: list[dict] | None) -> tuple[list[dict],
     return calls, cleaned.strip()
 
 
+def _text_tool_protocol(tools: list[dict] | None) -> str:
+    """Describe a constrained XML fallback for models without function calling."""
+    definitions = []
+    for item in tools or []:
+        function = item.get('function', {}) if isinstance(item, dict) else {}
+        name = str(function.get('name') or '').strip()
+        if not name:
+            continue
+        parameters = function.get('parameters') or {}
+        properties = parameters.get('properties') or {}
+        required = set(parameters.get('required') or [])
+        arguments = ', '.join(
+            f"{key}{'*' if key in required else ''}" for key in properties
+        ) or '无参数'
+        definitions.append(f'{name}({arguments})')
+    if not definitions:
+        return ''
+    return (
+        '工具文本兼容协议：优先使用接口原生 tool_calls。若当前模型不能输出原生工具调用，'
+        '则在需要调用工具时只输出 XML，不要同时输出解释文字。格式为 '
+        '<工具名><参数名>参数值</参数名></工具名>；无参数工具使用 <工具名/>。'
+        '对象或数组参数写成 JSON 文本，XML 特殊字符必须转义。一次最多调用 8 个工具。'
+        '只能使用以下工具，星号表示必填参数：' + '；'.join(definitions)
+    )
+
+
+def _tools_parameter_unsupported(error_text: str) -> bool:
+    text = str(error_text or '').casefold()
+    tool_marker = any(marker in text for marker in (
+        'tools', 'function_call', 'function calling', '函数调用',
+    ))
+    unsupported = any(marker in text for marker in (
+        'unsupported', 'not support', 'unknown', 'unrecognized', 'invalid',
+        'extra_forbidden', '不支持', '未知参数', '无效参数',
+    ))
+    return tool_marker and unsupported
+
+
 DEFAULT_CONFIG = {
     'enabled': True,
     'active_provider': 'ytea',
@@ -135,6 +186,7 @@ DEFAULT_CONFIG = {
     'max_tool_rounds': 6,
     'agent_enabled': True,
     'runtime_prompt': '',
+    'audit_include_content': False,
     'context': {
         'max_tokens': 65536,
         'max_turns': 30,
@@ -250,6 +302,7 @@ def normalize_config(value: dict | None) -> dict:
     result['max_tool_rounds'] = min(20, max(1, int(result.get('max_tool_rounds', 6))))
     result['agent_enabled'] = bool(result.get('agent_enabled', True))
     result['runtime_prompt'] = str(result.get('runtime_prompt') or '')[:30000]
+    result['audit_include_content'] = bool(result.get('audit_include_content', False))
     context = result.get('context') if isinstance(result.get('context'), dict) else {}
     result['context'] = {
         'max_tokens': min(2_000_000, max(0, int(context.get('max_tokens', 65536)))),
@@ -330,7 +383,12 @@ def normalize_config(value: dict | None) -> dict:
             'name': str(raw.get('name') or capability_id).strip()[:100],
             'description': str(raw.get('description') or '').strip()[:500],
             'enabled': bool(raw.get('enabled', True)),
-            'shared': bool(raw.get('shared', True)),
+            'shared': bool(raw.get('shared', kind == 'tool')),
+            'allowed_consumers': list(dict.fromkeys(
+                str(item).strip()[:128]
+                for item in raw.get('allowed_consumers', [])
+                if str(item).strip()
+            ))[:100] if isinstance(raw.get('allowed_consumers'), list) else [],
             'shared_configured': bool(raw.get('shared_configured', False)),
             'content': str(raw.get('content') or '')[:30000],
             'config': copy.deepcopy(raw.get('config')) if isinstance(raw.get('config'), dict) else {},
@@ -371,6 +429,7 @@ class AIService:
                     self._health[(provider['id'], model)] = copy.deepcopy(health)
         self.runtime = AgentRuntime(self, data_dir or '.')
         self.audit = InvocationAudit(data_dir or '.')
+        self.audit.set_include_content(self._config.get('audit_include_content', False))
 
     @staticmethod
     def _capability_allowed(item: dict, consumer_plugin: str = '') -> bool:
@@ -381,6 +440,7 @@ class AIService:
             return False
         return (
             consumer == item.get('source_plugin')
+            or consumer in set(item.get('allowed_consumers') or [])
             or bool(item.get('shared'))
         )
 
@@ -415,14 +475,14 @@ class AIService:
         incoming = copy.deepcopy(definition or {})
         incoming.update({'key': key, 'id': capability_id, 'kind': capability_kind, 'source_plugin': source})
         if current is not None:
-            for field in ('enabled', 'content'):
+            for field in ('enabled', 'content', 'allowed_consumers'):
                 if field in current:
                     incoming[field] = copy.deepcopy(current[field])
             if current.get('shared_configured'):
                 incoming['shared'] = bool(current.get('shared'))
                 incoming['shared_configured'] = True
             else:
-                incoming.setdefault('shared', True)
+                incoming['shared'] = capability_kind == 'tool'
                 incoming['shared_configured'] = False
             records = [
                 incoming if item.get('key') == key else item
@@ -430,7 +490,7 @@ class AIService:
             ]
         else:
             incoming.setdefault('enabled', True)
-            incoming.setdefault('shared', True)
+            incoming.setdefault('shared', capability_kind == 'tool')
             incoming.setdefault('shared_configured', False)
             records = [*self._config.get('plugin_capabilities', []), incoming]
         merged = copy.deepcopy(self._config)
@@ -459,7 +519,7 @@ class AIService:
             for current in self._config.get('plugin_capabilities', []):
                 update = updates.get(current.get('key'), {})
                 value = copy.deepcopy(current)
-                for field in ('enabled', 'shared', 'content'):
+                for field in ('enabled', 'shared', 'allowed_consumers', 'content'):
                     if field in update:
                         value[field] = copy.deepcopy(update[field])
                 if 'shared' in update:
@@ -468,6 +528,7 @@ class AIService:
             merged = copy.deepcopy(self._config)
             merged['plugin_capabilities'] = records
             self._config = normalize_config(merged)
+            self.audit.set_include_content(self._config.get('audit_include_content', False))
             self._save_callback(self._config)
             return self.plugin_capabilities(public=True)
 
@@ -606,6 +667,7 @@ class AIService:
             merged = copy.deepcopy(self._config)
             merged.update(value)
             self._config = normalize_config(merged)
+            self.audit.set_include_content(self._config.get('audit_include_content', False))
             self._save_callback(self._config)
             return self.config(public=True)
 
@@ -683,7 +745,121 @@ class AIService:
                 self._save_callback(self._config)
         return models
 
-    async def probe_models(self, provider_id: str, models: list[str] | None = None) -> list[dict]:
+    async def moderate(
+        self, text: str, *, provider_id: str = '', model: str = 'omni-moderation-latest',
+    ) -> dict:
+        """Run the provider's dedicated OpenAI-compatible Moderation API."""
+        provider = self._provider(provider_id)
+        if provider is None:
+            raise AIServiceError('没有可用的内容审核接口')
+        value = str(text or '').strip()
+        if not value:
+            return {'flagged': False, 'categories': [], 'model': model}
+        headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+        if provider.get('api_key'):
+            headers['Authorization'] = f"Bearer {provider['api_key']}"
+        timeout = aiohttp.ClientTimeout(total=min(30, self._config['request_timeout']))
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=timeout) as session,
+                session.post(
+                    provider['base_url'] + '/moderations', headers=headers,
+                    json={'model': model, 'input': value},
+                ) as response,
+            ):
+                raw = await response.text()
+                if response.status < 200 or response.status >= 300:
+                    raise AIServiceError(f'内容审核接口 HTTP {response.status}: {raw[:200]}')
+        except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as error:
+            raise AIServiceError(f'内容审核接口不可用：{error}') from error
+        try:
+            payload = json.loads(raw)
+            item = (payload.get('results') or [])[0]
+            categories = item.get('categories') or {}
+        except (AttributeError, IndexError, TypeError, json.JSONDecodeError) as error:
+            raise AIServiceError('内容审核接口返回格式无效') from error
+        return {
+            'flagged': bool(item.get('flagged')),
+            'categories': [str(name) for name, hit in categories.items() if hit],
+            'model': str(payload.get('model') or model),
+        }
+
+    async def generate_image(
+        self, prompt: str, *, candidates: list[dict], size: str = '1024x1024',
+        reference_image: bytes | None = None,
+    ) -> dict:
+        """Generate one image and fail over across an explicit provider/model route."""
+        value = str(prompt or '').strip()
+        if not value:
+            raise AIServiceError('生图描述不能为空')
+        route = []
+        seen = set()
+        for item in candidates or []:
+            if not isinstance(item, dict) or not item.get('enabled', True):
+                continue
+            provider_id = str(item.get('provider_id') or '').strip()
+            model = str(item.get('model') or '').strip()
+            key = (provider_id, model)
+            if not provider_id or not model or key in seen:
+                continue
+            provider = self._provider(provider_id)
+            if provider is not None:
+                route.append((provider, model))
+                seen.add(key)
+        if not route:
+            raise AIServiceError('没有配置可用的生图接口与模型')
+        image_size = size if size in {'256x256', '512x512', '1024x1024', '1024x1536', '1536x1024'} else '1024x1024'
+        errors = []
+        timeout = aiohttp.ClientTimeout(total=min(180, max(30, self._config['request_timeout'])))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for provider, model in route:
+                headers = {'Accept': 'application/json'}
+                if provider.get('api_key'):
+                    headers['Authorization'] = f"Bearer {provider['api_key']}"
+                try:
+                    if reference_image:
+                        form = aiohttp.FormData()
+                        form.add_field('model', model)
+                        form.add_field('prompt', value)
+                        form.add_field('size', image_size)
+                        form.add_field('n', '1')
+                        form.add_field(
+                            'image', reference_image, filename='persona.png',
+                            content_type='image/png',
+                        )
+                        request = session.post(
+                            provider['base_url'] + '/images/edits', headers=headers, data=form,
+                        )
+                    else:
+                        request = session.post(
+                            provider['base_url'] + '/images/generations',
+                            headers={**headers, 'Content-Type': 'application/json'},
+                            json={'model': model, 'prompt': value, 'size': image_size, 'n': 1},
+                        )
+                    async with request as response:
+                        raw = await response.text()
+                        if response.status < 200 or response.status >= 300:
+                            raise AIProviderError(f'HTTP {response.status}: {raw[:200]}')
+                    payload = json.loads(raw)
+                    item = (payload.get('data') or [])[0]
+                    url = str(item.get('url') or '').strip()
+                    encoded = str(item.get('b64_json') or '').strip()
+                    if not url and not encoded:
+                        raise AIProviderError('接口未返回 url 或 b64_json')
+                    return {
+                        'url': url, 'b64_json': encoded, 'provider_id': provider['id'],
+                        'provider': provider.get('name') or provider['id'], 'model': model,
+                    }
+                except (
+                    aiohttp.ClientError, asyncio.TimeoutError, TimeoutError,
+                    AttributeError, IndexError, TypeError, json.JSONDecodeError, AIProviderError,
+                ) as error:
+                    errors.append(f"{provider.get('name') or provider['id']}/{model}: {error}")
+        raise AIServiceError('所有生图接口均失败：' + '；'.join(errors)[:1000])
+
+    async def probe_models(
+        self, provider_id: str, models: list[str] | None = None, *, apply_results: bool = False,
+    ) -> list[dict]:
         provider = self._provider(provider_id)
         if provider is None:
             raise AIServiceError('接口不存在或未启用')
@@ -723,16 +899,18 @@ class AIService:
         async with self._lock:
             target = next((item for item in self._config['providers'] if item['id'] == provider_id), None)
             if target:
-                successful = [item['model'] for item in results if item['ok']]
-                failed = [item['model'] for item in results if not item['ok']]
-                tested = set(successful + failed)
-                old_priority = list(target.get('model_priority') or target.get('models') or [])
-                target['model_priority'] = successful + [
-                    model for model in old_priority if model not in successful and model in target.get('models', [])
-                ]
-                target['disabled_models'] = [
-                    model for model in target.get('disabled_models', []) if model not in tested
-                ] + failed
+                if apply_results:
+                    successful = [item['model'] for item in results if item['ok']]
+                    failed = [item['model'] for item in results if not item['ok']]
+                    tested = set(successful + failed)
+                    old_priority = list(target.get('model_priority') or target.get('models') or [])
+                    target['model_priority'] = successful + [
+                        model for model in old_priority
+                        if model not in successful and model in target.get('models', [])
+                    ]
+                    target['disabled_models'] = [
+                        model for model in target.get('disabled_models', []) if model not in tested
+                    ] + failed
                 health = target.setdefault('health', {})
                 for result in results:
                     record = {
@@ -765,7 +943,6 @@ class AIService:
             ):
                 first_byte_ms = round((time.perf_counter() - started) * 1000)
                 raw = await response.text()
-                elapsed = round((time.perf_counter() - started) * 1000)
                 if response.status < 200 or response.status >= 300:
                     if run_id:
                         self.audit.attempt_finish(
@@ -773,7 +950,7 @@ class AIService:
                             response=raw, error=f'HTTP {response.status}', ttfb_ms=first_byte_ms,
                             response_headers=dict(response.headers),
                         )
-                    raise AIServiceError(f'HTTP {response.status}: {raw[:300]}')
+                    raise AIProviderError(f'HTTP {response.status}: {raw[:300]}')
         except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as error:
             if run_id:
                 self.audit.attempt_finish(
@@ -789,7 +966,7 @@ class AIService:
                     response=raw, error='invalid JSON', ttfb_ms=first_byte_ms,
                     response_headers=dict(response.headers),
                 )
-            raise AIServiceError('接口返回了无效 JSON') from error
+            raise AIProviderError('接口返回了无效 JSON') from error
         if run_id:
             self.audit.attempt_finish(
                 run_id, attempt_id, status='success', http_status=response.status,
@@ -842,7 +1019,7 @@ class AIService:
                         ):
                             payload['max_completion_tokens'] = payload.pop('max_tokens')
                             continue
-                        raise AIServiceError(f'HTTP {response.status}: {raw[:300]}')
+                        raise AIProviderError(f'HTTP {response.status}: {raw[:300]}')
 
                     yield {'type': 'meta', 'provider_id': provider['id'],
                            'provider_name': provider['name'], 'model': model}
@@ -853,7 +1030,7 @@ class AIService:
                         try:
                             data = json.loads(raw)
                         except json.JSONDecodeError as error:
-                            raise AIServiceError('stream response was not valid JSON') from error
+                            raise AIProviderError('stream response was not valid JSON') from error
                         content = (data.get('choices') or [{}])[0].get('message', {}).get('content', '')
                         if isinstance(content, list):
                             content = ''.join(
@@ -888,7 +1065,7 @@ class AIService:
                         except json.JSONDecodeError:
                             continue
                         if event.get('error'):
-                            raise AIServiceError(str(event['error']))
+                            raise AIProviderError(str(event['error']))
                         usage = event.get('usage') or usage
                         choices = event.get('choices') or []
                         if not choices:
@@ -907,7 +1084,7 @@ class AIService:
                             response_text.append(str(content))
                             yield {'type': 'delta', 'text': str(content)}
                     if not saw_delta:
-                        raise AIServiceError('stream response contained no text')
+                        raise AIProviderError('stream response contained no text')
                     self._health[(provider['id'], model)] = {
                         'ok': True, 'error': '', 'checked_at': int(time.time()),
                     }
@@ -920,7 +1097,7 @@ class AIService:
                     yield {'type': 'done', 'usage': usage}
                     return
 
-        raise AIServiceError('stream request failed')
+        raise AIProviderError('stream request failed')
 
     async def stream_complete(
         self,
@@ -933,6 +1110,7 @@ class AIService:
         max_tokens: int | None = None,
         session_id: str = '',
         runtime_prompt: str = '',
+        prepare_context: bool = True,
     ) -> AsyncIterator[dict]:
         if not self._config['enabled']:
             raise AIServiceError('AI module is disabled')
@@ -952,7 +1130,7 @@ class AIService:
                 raise AIServiceError('no available AI provider')
             prepared_messages = (
                 self.runtime.prepare_context(messages)
-                if self._config.get('context', {}).get('compress_enabled', True)
+                if prepare_context and self._config.get('context', {}).get('compress_enabled', True)
                 else copy.deepcopy(messages)
             )
             prompts = [self._config.get('runtime_prompt', ''), runtime_prompt, system_prompt]
@@ -973,7 +1151,7 @@ class AIService:
                             final_usage = event.get('usage') or {}
                         yield event
                     return
-                except (AIServiceError, aiohttp.ClientError, TimeoutError) as error:
+                except (AIProviderError, aiohttp.ClientError, TimeoutError) as error:
                     last_error = error
                     self.audit.fail_running_attempt(run_id, str(error))
                     self._health[(provider['id'], candidate_model)] = {
@@ -1012,10 +1190,13 @@ class AIService:
         max_tool_rounds: int | None = None,
         session_id: str = '',
         runtime_prompt: str = '',
-        enable_runtime_tools: bool = True,
+        enable_runtime_tools: bool = False,
         allow_handoff: bool = True,
         consumer_plugin: str = '',
         runtime_capabilities: list[str] | None = None,
+        required_tools: list[str] | None = None,
+        prepare_context: bool = True,
+        completion_validator: CompletionValidator | None = None,
     ) -> dict:
         if not self._config['enabled']:
             raise AIServiceError('AI LLM 服务未启用')
@@ -1027,6 +1208,8 @@ class AIService:
             'provider_id': provider_id, 'model': model, 'temperature': temperature,
             'max_tokens': max_tokens, 'tools': tools or [],
             'enable_runtime_tools': enable_runtime_tools, 'runtime_capabilities': runtime_capabilities or [],
+            'required_tools': required_tools or [],
+            'prepare_context': bool(prepare_context),
         })
         try:
             candidates = self._candidates(provider_id, model)
@@ -1034,7 +1217,7 @@ class AIService:
                 raise AIServiceError('没有可用的 AI 接口')
             prepared_messages = (
                 self.runtime.prepare_context(messages)
-                if self._config.get('context', {}).get('compress_enabled', True)
+                if prepare_context and self._config.get('context', {}).get('compress_enabled', True)
                 else copy.deepcopy(messages)
             )
             prompts = [self._config.get('runtime_prompt', ''), system_prompt, runtime_prompt]
@@ -1078,6 +1261,66 @@ class AIService:
                     self.audit.tool_finish(run_id, tool_id, error='interrupted')
                     raise
 
+            required = list(dict.fromkeys(
+                str(name or '').strip() for name in (required_tools or [])
+                if str(name or '').strip()
+            ))
+            available = {
+                str(item.get('function', {}).get('name') or '')
+                for item in all_tools if isinstance(item, dict)
+            }
+            missing = [name for name in required if name not in available]
+            if missing:
+                raise AIServiceError('必要工具不可用：' + '、'.join(missing))
+            schemas = {
+                str(item.get('function', {}).get('name') or ''): item.get('function', {})
+                for item in all_tools if isinstance(item, dict)
+            }
+            needs_arguments = [
+                name for name in required
+                if (schemas.get(name, {}).get('parameters') or {}).get('required')
+            ]
+            if needs_arguments:
+                raise AIServiceError(
+                    '必要工具不能无参数预执行：' + '、'.join(needs_arguments)
+                )
+            if required:
+                evidence_messages = []
+                for index, name in enumerate(required):
+                    call_id = f'required_{run_id}_{index}'
+                    result = await combined_handler(name, {})
+                    if isinstance(result, dict) and (
+                        result.get('ok') is False
+                        or ('error' in result and len(result) == 1)
+                    ):
+                        detail = result.get('error') or '未知错误'
+                        raise AIServiceError(f'必要工具 {name} 执行失败：{detail}')
+                    evidence_messages.extend((
+                        {
+                            'role': 'assistant',
+                            'content': '',
+                            'tool_calls': [{
+                                'id': call_id,
+                                'type': 'function',
+                                'function': {'name': name, 'arguments': '{}'},
+                            }],
+                        },
+                        {
+                            'role': 'tool',
+                            'tool_call_id': call_id,
+                            'name': name,
+                            'content': json.dumps(
+                                result, ensure_ascii=False, default=str,
+                            )[:12000],
+                        },
+                    ))
+                if prepared_messages:
+                    prepared_messages = [
+                        *prepared_messages[:-1], *evidence_messages, prepared_messages[-1],
+                    ]
+                else:
+                    prepared_messages = evidence_messages
+
             last_error = None
             for provider, candidate_model in candidates:
                 try:
@@ -1085,12 +1328,12 @@ class AIService:
                         provider, candidate_model, prepared_messages, combined_prompt,
                         temperature, max_tokens, all_tools or None,
                         combined_handler if all_tools else None, max_tool_rounds,
-                        run_id,
+                        run_id, completion_validator,
                     )
                     result['run_id'] = run_id
                     final_result = result
                     return result
-                except (AIServiceError, aiohttp.ClientError, TimeoutError) as error:
+                except (AIProviderError, aiohttp.ClientError, TimeoutError) as error:
                     last_error = error
                     self.audit.fail_running_attempt(run_id, str(error))
                     self._health[(provider['id'], candidate_model)] = {
@@ -1116,13 +1359,23 @@ class AIService:
             )
             self.runtime.finish_run(run_id, error_text)
 
+    async def run_agent(self, messages: list[dict], **kwargs) -> dict:
+        """Run an explicit agent loop with central runtime capabilities enabled."""
+        kwargs['enable_runtime_tools'] = True
+        return await self.complete(messages, **kwargs)
+
     async def _complete_candidate(
         self, provider, model, messages, system_prompt, temperature,
         max_tokens, tools, tool_handler, max_tool_rounds, run_id='',
+        completion_validator: CompletionValidator | None = None,
     ) -> dict:
         payload_messages = copy.deepcopy(messages)
-        if system_prompt:
-            payload_messages.insert(0, {'role': 'system', 'content': system_prompt})
+        compatibility_prompt = _text_tool_protocol(tools)
+        effective_prompt = '\n\n'.join(
+            item for item in (system_prompt, compatibility_prompt) if item
+        )
+        if effective_prompt:
+            payload_messages.insert(0, {'role': 'system', 'content': effective_prompt})
         payload = {
             'model': model,
             'messages': payload_messages,
@@ -1131,13 +1384,29 @@ class AIService:
         }
         if tools:
             payload['tools'] = tools
-            payload['tool_choice'] = 'auto'
+            payload['tool_choice'] = 'required' if completion_validator is not None else 'auto'
         rounds = self._config['max_tool_rounds'] if max_tool_rounds is None else max_tool_rounds
+        tool_events = []
         for _round in range(max(1, rounds + 1)):
             try:
                 data = await self._request(provider, payload, run_id)
             except AIServiceError as error:
-                if 'max_tokens' in str(error).lower() and 'max_completion_tokens' not in payload:
+                error_text = str(error).lower()
+                if (
+                    payload.get('tool_choice') == 'required'
+                    and 'tool_choice' in error_text
+                ):
+                    # Some OpenAI-compatible gateways only accept "auto". The
+                    # completion validator still prevents a prose-only success.
+                    payload['tool_choice'] = 'auto'
+                    data = await self._request(provider, payload, run_id)
+                elif 'tools' in payload and _tools_parameter_unsupported(error_text):
+                    # Keep the local schemas for XML parsing, but stop sending native
+                    # function-calling fields to endpoints that reject them.
+                    payload.pop('tools', None)
+                    payload.pop('tool_choice', None)
+                    data = await self._request(provider, payload, run_id)
+                elif 'max_tokens' in error_text and 'max_completion_tokens' not in payload:
                     payload['max_completion_tokens'] = payload.pop('max_tokens')
                     data = await self._request(provider, payload, run_id)
                 else:
@@ -1145,18 +1414,40 @@ class AIService:
             try:
                 message = data['choices'][0]['message']
             except (KeyError, IndexError, TypeError) as error:
-                raise AIServiceError('接口返回中没有 choices[0].message') from error
+                raise AIProviderError('接口返回中没有 choices[0].message') from error
             tool_calls = message.get('tool_calls') or []
             fallback_content = message.get('content')
+            text_protocol = False
             if not tool_calls and isinstance(fallback_content, str):
                 tool_calls, fallback_content = _xml_tool_calls(fallback_content, tools)
+                text_protocol = bool(tool_calls)
             if not tool_calls:
                 content = message.get('content')
                 if isinstance(content, list):
                     content = ''.join(str(part.get('text') or '') for part in content if isinstance(part, dict))
                 text = str(content or '').strip()
                 if not text:
-                    raise AIServiceError('接口返回了空消息')
+                    raise AIProviderError('接口返回了空消息')
+                validation_error = (
+                    completion_validator(text, copy.deepcopy(tool_events))
+                    if completion_validator is not None else None
+                )
+                if validation_error:
+                    if not tools or tool_handler is None or _round >= rounds:
+                        raise AIExecutionIncomplete(str(validation_error))
+                    payload['messages'].extend((
+                        {'role': 'assistant', 'content': text},
+                        {
+                            'role': 'user',
+                            'content': (
+                                '[执行校验未通过] ' + str(validation_error)
+                                + '\n下一条消息只调用一个能够完成该步骤的工具。'
+                                  '收到真实工具结果后再继续下一步，不要输出计划或伪造结果。'
+                            ),
+                        },
+                    ))
+                    payload['tool_choice'] = 'required'
+                    continue
                 self._health[(provider['id'], model)] = {
                     'ok': True, 'error': '', 'checked_at': int(time.time()),
                 }
@@ -1169,24 +1460,59 @@ class AIService:
                 }
             if tool_handler is None or _round >= rounds:
                 raise AIServiceError('模型请求了不可用工具或达到工具轮数上限')
-            payload['messages'].append({
-                'role': 'assistant',
-                'content': fallback_content or '',
-                'tool_calls': tool_calls,
-            })
-            for call in tool_calls[:8]:
+            if len(tool_calls) > 8:
+                raise AIProviderError('接口单次返回的工具调用超过 8 个')
+            if text_protocol:
+                payload['messages'].append({
+                    'role': 'assistant',
+                    'content': fallback_content or '[请求执行工具]',
+                })
+            else:
+                payload['messages'].append({
+                    'role': 'assistant',
+                    'content': fallback_content or '',
+                    'tool_calls': tool_calls,
+                })
+            text_results = []
+            for call in tool_calls:
                 function = call.get('function') or {}
+                function_name = str(function.get('name') or '')
                 try:
                     arguments = json.loads(function.get('arguments') or '{}')
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError) as error:
                     arguments = {}
-                result = tool_handler(str(function.get('name') or ''), arguments)
-                if asyncio.iscoroutine(result):
-                    result = await result
-                payload['messages'].append({
-                    'role': 'tool',
-                    'tool_call_id': str(call.get('id') or ''),
-                    'name': str(function.get('name') or ''),
-                    'content': json.dumps(result, ensure_ascii=False, default=str)[:12000],
+                    detail = error.msg if isinstance(error, json.JSONDecodeError) else str(error)
+                    result = {'ok': False, 'error': f'工具参数不是合法 JSON：{detail}'}
+                else:
+                    if not isinstance(arguments, dict):
+                        result = {'ok': False, 'error': '工具参数必须是 JSON 对象'}
+                    else:
+                        result = tool_handler(function_name, arguments)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                tool_events.append({
+                    'name': function_name,
+                    'arguments': copy.deepcopy(arguments),
+                    'result': copy.deepcopy(result),
                 })
+                serialized = json.dumps(result, ensure_ascii=False, default=str)[:12000]
+                if text_protocol:
+                    text_results.append(f'[工具 {function_name} 执行结果]\n{serialized}')
+                else:
+                    payload['messages'].append({
+                        'role': 'tool',
+                        'tool_call_id': str(call.get('id') or ''),
+                        'name': function_name,
+                        'content': serialized,
+                    })
+            if text_protocol:
+                payload['messages'].append({
+                    'role': 'user',
+                    'content': (
+                        '\n\n'.join(text_results)
+                        + '\n请基于真实结果继续；需要更多信息时继续使用同一 XML 工具协议。'
+                    ),
+                })
+            if 'tools' in payload:
+                payload['tool_choice'] = 'auto'
         raise AIServiceError('达到工具轮数上限')

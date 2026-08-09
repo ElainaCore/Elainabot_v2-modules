@@ -118,11 +118,11 @@ export function readItems(selector) {
   });
 }
 export function collectCommon() {
-  return {enabled: $('enabled').checked, agent_enabled: $('agent_enabled').checked, auto_switch: $('auto_switch').checked, auto_fetch_models: $('auto_fetch_models').checked, temperature: Number($('temperature').value), max_tokens: Number($('max_tokens').value), max_tool_rounds: Number($('max_tool_rounds').value), request_timeout: Number($('request_timeout').value), runtime_prompt: $('runtime_prompt').value, context: {max_tokens: Number($('context_max_tokens').value), max_turns: Number($('context_max_turns').value), keep_recent_ratio: Number($('context_keep_ratio').value), compress_enabled: $('context_compress').checked}, skills: {enabled: $('skills_enabled').checked, enabled_ids: [...document.querySelectorAll('[data-skill-id]:checked')].map(node => node.dataset.skillId)}, mcp: {enabled: $('mcp_enabled').checked, servers: readItems('#mcp-list .item')}, sandbox: {...state.sandbox, enabled: $('sandbox_enabled').checked, endpoint: $('sandbox_endpoint').value.trim(), token: $('sandbox_token').value.trim(), execution_timeout: Number($('sandbox_exec_timeout').value)}, subagents: readItems('#agent-list .item'), cron_jobs: readItems('#cron-list .item')};
+  return {enabled: $('enabled').checked, agent_enabled: $('agent_enabled').checked, auto_switch: $('auto_switch').checked, auto_fetch_models: $('auto_fetch_models').checked, audit_include_content: $('audit_include_content').checked, temperature: Number($('temperature').value), max_tokens: Number($('max_tokens').value), max_tool_rounds: Number($('max_tool_rounds').value), request_timeout: Number($('request_timeout').value), runtime_prompt: $('runtime_prompt').value, context: {max_tokens: Number($('context_max_tokens').value), max_turns: Number($('context_max_turns').value), keep_recent_ratio: Number($('context_keep_ratio').value), compress_enabled: $('context_compress').checked}, skills: {enabled: $('skills_enabled').checked, enabled_ids: [...document.querySelectorAll('[data-skill-id]:checked')].map(node => node.dataset.skillId)}, mcp: {enabled: $('mcp_enabled').checked, servers: readItems('#mcp-list .item')}, sandbox: {...state.sandbox, enabled: $('sandbox_enabled').checked, endpoint: $('sandbox_endpoint').value.trim(), token: $('sandbox_token').value.trim(), execution_timeout: Number($('sandbox_exec_timeout').value)}, subagents: readItems('#agent-list .item'), cron_jobs: readItems('#cron-list .item')};
 }
 export function sectionPayload(section) {
   const common = collectCommon();
-  if (section === 'overview') return {enabled: common.enabled, agent_enabled: common.agent_enabled, auto_switch: common.auto_switch, auto_fetch_models: common.auto_fetch_models, temperature: common.temperature, max_tokens: common.max_tokens, max_tool_rounds: common.max_tool_rounds, request_timeout: common.request_timeout};
+  if (section === 'overview') return {enabled: common.enabled, agent_enabled: common.agent_enabled, auto_switch: common.auto_switch, auto_fetch_models: common.auto_fetch_models, audit_include_content: common.audit_include_content, temperature: common.temperature, max_tokens: common.max_tokens, max_tool_rounds: common.max_tool_rounds, request_timeout: common.request_timeout};
   if (section === 'agents') return {subagents: common.subagents};
   if (section === 'context') return {runtime_prompt: common.runtime_prompt, context: common.context};
   if (section === 'skills') return {skills: common.skills};
@@ -132,7 +132,7 @@ export function sectionPayload(section) {
   return {};
 }
 export function renderCommon() {
-  ['enabled', 'agent_enabled', 'auto_switch', 'auto_fetch_models'].forEach(key => $(key).checked = !!state[key]);
+  ['enabled', 'agent_enabled', 'auto_switch', 'auto_fetch_models', 'audit_include_content'].forEach(key => $(key).checked = !!state[key]);
   ['temperature', 'max_tokens', 'max_tool_rounds', 'request_timeout'].forEach(key => $(key).value = state[key] ?? '');
   $('runtime_prompt').value = state.runtime_prompt || '';
   $('context_max_tokens').value = state.context?.max_tokens ?? 65536;

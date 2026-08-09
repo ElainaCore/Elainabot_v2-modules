@@ -60,10 +60,11 @@ async function probeModels(card, button, loadAll) {
   summary.textContent = '正在用“你好”逐模型测活...';
   try {
     const item = await saveProvider(card, false, () => {});
-    const data = await api('/health', {method: 'POST', body: JSON.stringify({provider_id: item.id, models: item.models})});
+    const data = await api('/health', {method: 'POST', body: JSON.stringify({provider_id: item.id, models: item.models, apply_results: true})});
     const results = Object.fromEntries(data.results.map(result => [result.model, result]));
     card.querySelectorAll('.model-row').forEach(row => {
       const result = results[row.dataset.model], dot = row.querySelector('.health-dot');
+      row.querySelector('.model-enabled').checked = result?.ok === true;
       dot.className = 'health-dot ' + (result?.ok ? 'ok' : 'fail');
       dot.title = result?.ok ? ('可用 · ' + result.latency_ms + 'ms') : (result?.error || '不可用');
     });

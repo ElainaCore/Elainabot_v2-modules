@@ -13,13 +13,13 @@ from core.base.config import cfg
 from core.base.logger import EXTENSION, get_logger
 from core.plugin.web_pages import register_page, register_route, unregister_page, unregister_route
 
-from .migration import load_ai_dev_config
-from .service import DEFAULT_CONFIG, AIService
+from .app.migration import load_ai_dev_config
+from .app.service import DEFAULT_CONFIG, AIService
 
 __module_meta__ = {
     'name': 'AI LLM 服务',
     'description': '统一管理 LLM、Agent、MCP、Skills、沙箱与计划任务',
-    'version': '1.0.0',
+    'version': '1.0.1',
     'author': 'ElainaBot',
 }
 
@@ -79,7 +79,7 @@ async def setup(ctx):
         label='AI LLM 服务',
         source='module',
         source_name='AI LLM 服务',
-        html_file=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'panel.html'),
+        html_file=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web', 'panel.html'),
     )
     if config.get('auto_fetch_models'):
         _refresh_task = asyncio.create_task(_refresh_missing_models())
@@ -182,6 +182,7 @@ async def _health(request):
     try:
         results = await _service().probe_models(
             str(body.get('provider_id') or ''), models,
+            apply_results=bool(body.get('apply_results', False)),
         )
         return web.json_response({'success': True, 'data': {'results': results}})
     except (RuntimeError, OSError) as error:

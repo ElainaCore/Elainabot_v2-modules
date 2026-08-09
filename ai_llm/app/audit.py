@@ -14,40 +14,77 @@ _SENSITIVE_KEY = re.compile(
     re.IGNORECASE,
 )
 _BEARER = re.compile(r'(?i)bearer\s+[a-z0-9._~+\-/=]{8,}')
+_INLINE_SECRET = re.compile(
+    r'(?i)(?P<label>(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)'
+    r'\s*[:=]\s*)[^\s,;\"\']{6,}'
+)
+_PRIVATE_VALUE = re.compile(
+    r'(?<![\w.])(?:127(?:\.\d{1,3}){3}|10(?:\.\d{1,3}){3}|'
+    r'192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|'
+    r'169\.254(?:\.\d{1,3}){2}|localhost)(?![\w.])',
+    re.IGNORECASE,
+)
 _MAX_TEXT = 50000
 _MAX_RECORDS = 500
+_CONTENT_KEYS = {
+    'content', 'messages', 'system_prompt', 'runtime_prompt', 'prompt', 'request',
+    'response', 'arguments', 'result', 'body', 'code',
+}
 
 
-def _safe(value, depth: int = 0):
+def _redact_text(value: str) -> str:
+    text = _BEARER.sub('Bearer ********', str(value))
+    text = _INLINE_SECRET.sub(lambda match: match.group('label') + '********', text)
+    return _PRIVATE_VALUE.sub('[private-address]', text)
+
+
+def _safe(value, depth: int = 0, *, include_content: bool = False, key: str = ''):
     if depth > 10:
         return '[depth limit]'
     if isinstance(value, dict):
         return {
-            str(key): ('********' if _SENSITIVE_KEY.search(str(key)) else _safe(item, depth + 1))
-            for key, item in value.items()
+            str(item_key): (
+                '********' if _SENSITIVE_KEY.search(str(item_key))
+                else '[content omitted]' if not include_content and str(item_key).casefold() in _CONTENT_KEYS
+                else _safe(item, depth + 1, include_content=include_content, key=str(item_key))
+            )
+            for item_key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [_safe(item, depth + 1) for item in value[:500]]
+        return [_safe(item, depth + 1, include_content=include_content, key=key) for item in value[:500]]
     if isinstance(value, str):
-        text = _BEARER.sub('Bearer ********', value)
+        if not include_content and key.casefold() in _CONTENT_KEYS:
+            return '[content omitted]'
+        text = _redact_text(value)
         return text if len(text) <= _MAX_TEXT else text[:_MAX_TEXT] + '\n...[truncated]'
     if value is None or isinstance(value, (int, float, bool)):
         return value
-    return _safe(str(value), depth + 1)
+    return _safe(str(value), depth + 1, include_content=include_content, key=key)
 
 
 class InvocationAudit:
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, *, include_content: bool = False):
         self._path = os.path.join(data_dir, 'invocation_logs.json')
         self._records: deque[dict] = deque(maxlen=_MAX_RECORDS)
+        self._include_content = bool(include_content)
         self._load()
+
+    def set_include_content(self, enabled: bool) -> None:
+        self._include_content = bool(enabled)
+
+    def _safe(self, value):
+        return _safe(value, include_content=self._include_content)
 
     def _load(self):
         try:
             with open(self._path, encoding='utf-8') as file:
                 values = json.load(file)
             if isinstance(values, list):
-                self._records.extend(item for item in values[-_MAX_RECORDS:] if isinstance(item, dict))
+                self._records.extend(
+                    _safe(item, include_content=self._include_content)
+                    for item in values[-_MAX_RECORDS:] if isinstance(item, dict)
+                )
+                self._save()
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -72,7 +109,7 @@ class InvocationAudit:
             'consumer_plugin': str(consumer_plugin or ''),
             'started_at': now, 'finished_at': None, 'duration_ms': None,
             'ttfb_ms': None, 'tokens_per_second': None,
-            'request': _safe(request), 'response': None, 'usage': {},
+            'request': self._safe(request), 'response': None, 'usage': {},
             'attempts': [], 'tools': [], 'events': [], 'error': '',
         })
         self._save()
@@ -81,7 +118,7 @@ class InvocationAudit:
         record = self._find(run_id)
         if record is None:
             return
-        record['events'].append({'time': time.time(), 'type': event_type, 'data': _safe(data or {})})
+        record['events'].append({'time': time.time(), 'type': event_type, 'data': self._safe(data or {})})
         record['events'] = record['events'][-200:]
         self._save()
 
@@ -93,14 +130,14 @@ class InvocationAudit:
                 'id': attempt_id, 'provider_id': provider.get('id', ''),
                 'provider_name': provider.get('name', ''), 'model': model,
                 'endpoint': str(provider.get('base_url') or '').rstrip('/') + '/chat/completions',
-                'request_headers': _safe({
+                'request_headers': self._safe({
                     'Content-Type': 'application/json',
                     'Authorization': 'Bearer ' + str(provider.get('api_key') or ''),
                 }),
                 'response_headers': {},
                 'started_at': time.time(), 'duration_ms': None, 'ttfb_ms': None,
                 'http_status': None, 'request_bytes': len(json.dumps(payload, ensure_ascii=False, default=str).encode('utf-8')),
-                'response_bytes': None, 'request': _safe(payload), 'response': None,
+                'response_bytes': None, 'request': self._safe(payload), 'response': None,
                 'usage': {}, 'status': 'running', 'error': '',
             })
             self._save()
@@ -118,10 +155,10 @@ class InvocationAudit:
         attempt['duration_ms'] = round((time.time() - attempt['started_at']) * 1000)
         attempt['ttfb_ms'] = ttfb_ms
         attempt['http_status'] = http_status
-        attempt['response_headers'] = _safe(response_headers or {})
-        attempt['response'] = _safe(response)
+        attempt['response_headers'] = self._safe(response_headers or {})
+        attempt['response'] = self._safe(response)
         attempt['response_bytes'] = len(json.dumps(response, ensure_ascii=False, default=str).encode('utf-8')) if response is not None else 0
-        attempt['usage'] = _safe(usage or {})
+        attempt['usage'] = self._safe(usage or {})
         completion_tokens = int(
             (usage or {}).get('completion_tokens')
             or (usage or {}).get('output_tokens')
@@ -133,7 +170,7 @@ class InvocationAudit:
             if completion_tokens and generation_ms > 0 else None
         )
         attempt['status'] = status
-        attempt['error'] = str(error or '')[:2000]
+        attempt['error'] = _redact_text(str(error or ''))[:2000]
         if record.get('ttfb_ms') is None and ttfb_ms is not None:
             record['ttfb_ms'] = ttfb_ms
         self._save()
@@ -154,7 +191,7 @@ class InvocationAudit:
         tool_id = f"tool-{len(record.get('tools', [])) + 1 if record else 1}"
         if record is not None:
             record['tools'].append({
-                'id': tool_id, 'name': str(name), 'arguments': _safe(arguments),
+                'id': tool_id, 'name': str(name), 'arguments': self._safe(arguments),
                 'started_at': time.time(), 'duration_ms': None, 'status': 'running',
                 'result': None, 'error': '',
             })
@@ -170,8 +207,8 @@ class InvocationAudit:
             return
         tool['duration_ms'] = round((time.time() - tool['started_at']) * 1000)
         tool['status'] = 'error' if error else 'success'
-        tool['result'] = _safe(result)
-        tool['error'] = str(error or '')[:2000]
+        tool['result'] = self._safe(result)
+        tool['error'] = _redact_text(str(error or ''))[:2000]
         self._save()
 
     def finish(self, run_id: str, *, response=None, usage: dict | None = None, error: str = ''):
@@ -181,9 +218,9 @@ class InvocationAudit:
         record['finished_at'] = time.time()
         record['duration_ms'] = round((record['finished_at'] - record['started_at']) * 1000)
         record['status'] = 'error' if error else 'success'
-        record['response'] = _safe(response)
-        record['usage'] = _safe(usage or {})
-        record['error'] = str(error or '')[:4000]
+        record['response'] = self._safe(response)
+        record['usage'] = self._safe(usage or {})
+        record['error'] = _redact_text(str(error or ''))[:4000]
         completion_tokens = int((usage or {}).get('completion_tokens') or (usage or {}).get('output_tokens') or 0)
         generation_ms = record['duration_ms'] - int(record.get('ttfb_ms') or 0)
         if completion_tokens and generation_ms > 0:
@@ -233,4 +270,7 @@ class InvocationAudit:
             'provider_id': last.get('provider_id', ''), 'provider_name': last.get('provider_name', ''),
             'model': last.get('model', ''), 'attempt_count': len(attempts),
             'tool_count': len(item.get('tools', [])),
+            'endpoint': last.get('endpoint', ''), 'http_status': last.get('http_status'),
+            'request_bytes': last.get('request_bytes', 0),
+            'response_bytes': last.get('response_bytes', 0),
         }
