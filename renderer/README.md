@@ -44,7 +44,7 @@ if pil:
     image_bytes, width, height = await pil.render(render_card, "来自插件的卡片")
 ```
 
-`await pil.render(fn, *args, **kwargs)` 在独立进程执行同步函数并返回其结果。`fn`、参数和返回值必须可以被 `pickle` 序列化；函数应定义在插件模块顶层，不能使用 lambda、局部函数或闭包。任务默认超时 60 秒，超时或 worker 崩溃会回收并重建进程池。
+`await pil.render(fn, *args, **kwargs)` 在独立进程执行同步函数并返回其结果。`fn`、参数和返回值必须可以被 `pickle` 序列化；函数应定义在插件模块顶层，不能使用 lambda、局部函数或闭包。任务默认超时 60 秒，超时或 worker 崩溃会回收并重建进程池。常驻池默认空闲 300 秒后整体退出，下一次渲染时按需重建，以确保 Pillow 未归还的 RSS 最终由进程退出回收。
 
 ## Playwright 浏览器渲染
 
@@ -95,5 +95,5 @@ async with pw.new_page(viewport=(1200, 800)) as page:
 
 - 渲染 API 都是异步的；不要在事件循环中自行调用大型同步 PIL 绘制。
 - 浏览器页面并发受 `max_pages` 限制，超出会排队。
-- `close_after_use: true` 适合低内存环境，但每次调用都会重新启动浏览器。
+- `close_after_use: true` 适合低内存环境，但每次调用都会重新启动浏览器，并自动将页面并发限制为 1，避免并发请求互相关闭或覆盖 browser。
 - 插件卸载时无需调用 `close()`；由 Renderer 模块统一回收。

@@ -24,7 +24,7 @@
 __module_meta__ = {
     'name': '渲染引擎',
     'description': 'PIL 子进程渲染池 + Playwright 浏览器渲染统一管理, 全局共享按需启停',
-    'version': '2.0.0',
+    'version': '2.0.1',
     'author': 'ElainaBot',
 }
 

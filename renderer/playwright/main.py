@@ -23,6 +23,7 @@
 """
 
 import contextlib
+import asyncio
 import os
 from contextlib import asynccontextmanager
 
@@ -76,28 +77,32 @@ _COMMENTS = {
 }
 
 
-# ==================== PlaywrightRenderer ====================
+# ==================== 浏览器渲染器 ====================
 
 
 class PlaywrightRenderer(IdleEngine):
     """异步 Playwright 浏览器渲染器 (按需启动, 空闲关闭)"""
 
-    __slots__ = ('_pw', '_browser', '_last_error')
+    __slots__ = ('_pw', '_browser', '_last_error', '_lifecycle_lock')
 
     def __init__(self, cfg):
-        super().__init__(cfg, cfg.get('max_pages', 2))
+        # 用完即关模式只允许一个页面，避免并发启动多个浏览器。
+        max_pages = 1 if cfg.get('close_after_use', False) else cfg.get('max_pages', 2)
+        super().__init__(cfg, max_pages)
         self._pw = None
         self._browser = None
         self._last_error = None
+        self._lifecycle_lock = asyncio.Lock()
 
     async def close(self):
-        self._closed = True
-        self._stop_idle_cleanup()
-        await self._close_browser()
-        if self._pw:
-            with contextlib.suppress(Exception):
-                await self._pw.stop()
-            self._pw = None
+        async with self._lifecycle_lock:
+            self._closed = True
+            self._stop_idle_cleanup()
+            await self._close_browser()
+            if self._pw:
+                with contextlib.suppress(Exception):
+                    await self._pw.stop()
+                self._pw = None
 
     async def _close_browser(self):
         """关闭浏览器进程"""
@@ -136,6 +141,8 @@ class PlaywrightRenderer(IdleEngine):
     async def _do_launch(self, restarting):
         """实际启动浏览器"""
         try:
+            if restarting:
+                await self._close_browser()
             if not self._pw:
                 from playwright.async_api import async_playwright
                 self._pw = await async_playwright().start()
@@ -159,12 +166,28 @@ class PlaywrightRenderer(IdleEngine):
 
     async def _release_idle(self):
         """空闲超时关闭浏览器"""
-        if not self._browser:
-            return
-        async with self._lock:
+        async with self._lifecycle_lock:
             if self._active == 0 and self._browser:
                 log.info(f'浏览器空闲超过 {self._cfg.get("idle_timeout", 300)}s, 自动关闭')
                 await self._close_browser()
+
+    async def _open_page(self, viewport):
+        if not await self._ensure_browser():
+            raise RuntimeError(f'Playwright 浏览器不可用: {self._last_error or "未知原因"}')
+
+        vw = viewport[0] if viewport else self._cfg.get('default_viewport_width', 1280)
+        vh = viewport[1] if viewport else self._cfg.get('default_viewport_height', 720)
+        try:
+            return await self._browser.new_page(viewport={'width': vw, 'height': vh})
+        except Exception as e:
+            connected = self._browser and self._browser.is_connected()
+            if self._cfg.get('close_after_use', False) or ('Connection closed' not in str(e) and connected):
+                raise
+            log.warning(f'浏览器连接已断开, 尝试重启: {e}')
+            await self._close_browser()
+            if not await self._ensure_browser():
+                raise RuntimeError(f'Playwright 浏览器重启失败: {self._last_error or "未知原因"}') from e
+            return await self._browser.new_page(viewport={'width': vw, 'height': vh})
 
     # ---------- 核心 API ----------
 
@@ -181,46 +204,29 @@ class PlaywrightRenderer(IdleEngine):
             raise RuntimeError('Playwright 已关闭')
 
         async with self._semaphore:
-            if not await self._ensure_browser():
-                raise RuntimeError(f'Playwright 浏览器不可用: {self._last_error or "未知原因"}')
-
-            self._active += 1
-            vw = viewport[0] if viewport else self._cfg.get('default_viewport_width', 1280)
-            vh = viewport[1] if viewport else self._cfg.get('default_viewport_height', 720)
-
+            # 先登记任务，避免启动期间被空闲回收。
+            async with self._lifecycle_lock:
+                if self._closed:
+                    raise RuntimeError('Playwright 已关闭')
+                self._active += 1
+            page = None
             try:
-                page = await self._browser.new_page(
-                    viewport={'width': vw, 'height': vh},
-                )
-            except Exception as e:
-                if not self._cfg.get('close_after_use', False) and (
-                    'Connection closed' in str(e) or not (self._browser and self._browser.is_connected())
-                ):
-                    log.warning(f'浏览器连接已断开, 尝试重启: {e}')
-                    await self._close_browser()
-                    if not await self._ensure_browser():
-                        self._active -= 1
-                        raise RuntimeError(f'Playwright 浏览器重启失败: {self._last_error or "未知原因"}') from e
-                    page = await self._browser.new_page(
-                        viewport={'width': vw, 'height': vh},
-                    )
-                else:
-                    self._active -= 1
-                    raise
-            page.set_default_timeout(self._cfg.get('default_timeout', 30000))
-            try:
+                page = await self._open_page(viewport)
+                page.set_default_timeout(self._cfg.get('default_timeout', 30000))
                 yield page
             finally:
-                with contextlib.suppress(Exception):
-                    await page.close()
-                self._active -= 1
-                if self._active <= 0:
-                    self._active = 0
-                    self._mark_released()
-                    if self._cfg.get('close_after_use', False):
-                        await self._shutdown_all()
-                    elif self._cfg.get('idle_timeout', 300) == 0:
-                        await self._close_browser()
+                if page is not None:
+                    with contextlib.suppress(Exception):
+                        await page.close()
+                async with self._lifecycle_lock:
+                    self._active -= 1
+                    if self._active <= 0:
+                        self._active = 0
+                        self._mark_released()
+                        if self._cfg.get('close_after_use', False):
+                            await self._shutdown_all()
+                        elif self._cfg.get('idle_timeout', 300) == 0:
+                            await self._close_browser()
 
     async def screenshot_url(
         self,

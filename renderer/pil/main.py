@@ -17,7 +17,6 @@ import contextlib
 import ctypes
 import multiprocessing
 import os
-import pickle
 import signal
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -34,7 +33,6 @@ try:
 except OSError:
     _libc = None
 
-
 def _trim_memory():
     """把 glibc 空闲堆内存归还系统: PIL 大图渲染后 free 的内存默认留在 arena 里不还,
     长命子进程 RSS 会居高不下, malloc_trim(0) 主动收缩。非 glibc 平台静默跳过。"""
@@ -48,7 +46,8 @@ _DEFAULTS = {
     'max_workers': 2,
     'max_concurrent': 4,
     'idle_timeout': 300,
-    'resident_idle_timeout': 0,
+    # 常驻进程空闲 300 秒后销毁，下次渲染时按需重建。
+    'resident_idle_timeout': 300,
     'task_timeout': 60,
     'max_tasks_per_worker': 300,
 }
@@ -65,7 +64,7 @@ _COMMENTS = {
 
 
 def _invoke(fn, args, kwargs):
-    """子进程侧执行入口: 渲染后归还空闲堆内存, 避免子进程 RSS 随大图渲染累积"""
+    """子进程侧执行入口: 渲染后归还空闲堆内存"""
     try:
         return fn(*args, **kwargs)
     finally:
@@ -75,31 +74,31 @@ def _invoke(fn, args, kwargs):
 class PILRenderPool(IdleEngine):
     """PIL 子进程渲染池 — 常驻池 + 弹性池 (空闲回收, 崩溃重建)"""
 
-    __slots__ = ('_resident', '_burst', '_resident_tasks')
+    __slots__ = ('_resident', '_burst', '_resident_tasks', '_lifecycle_lock')
 
     def __init__(self, cfg):
         super().__init__(cfg, cfg.get('max_concurrent', 4))
         self._resident = None
         self._burst = None
         self._resident_tasks = 0
+        # 用同一把锁保护任务进入和进程池回收，避免回收竞态。
+        self._lifecycle_lock = asyncio.Lock()
 
     async def render(self, fn, *args, **kwargs):
         """在子进程池执行同步渲染函数并返回结果"""
         if self._closed:
             raise RuntimeError('PIL 渲染池已关闭')
-        try:
-            pickle.dumps((fn, args, kwargs))
-        except Exception as e:
-            raise ValueError(f'{getattr(fn, "__name__", fn)} 参数不可 pickle, 无法提交到子进程渲染: {e}') from e
-
         async with self._semaphore:
-            self._active += 1
+            # 等待旧池摘除后再创建新池。
+            async with self._lifecycle_lock:
+                self._active += 1
             try:
                 return await self._run_in_pool(fn, args, kwargs, retried=False)
             finally:
-                self._active -= 1
-                self._mark_released()
-                await self._maybe_recycle_resident()
+                async with self._lifecycle_lock:
+                    self._active -= 1
+                    self._mark_released()
+                    await self._maybe_recycle_resident()
 
     async def _run_in_pool(self, fn, args, kwargs, retried):
         pool = await self._pick_pool()
@@ -112,7 +111,7 @@ class PILRenderPool(IdleEngine):
                 self._resident_tasks += 1
             return result
         except TimeoutError:
-            # 卡住的 worker 不会随 future 取消, 回收整个池避免后续任务排队在死进程后面
+            # 卡住的进程无法随 future 取消，直接回收整个池。
             fut.cancel()
             await self._discard(pool)
             log.warning(f'渲染任务 {getattr(fn, "__name__", fn)} 超时({timeout}s), 已回收渲染进程池')
@@ -145,8 +144,12 @@ class PILRenderPool(IdleEngine):
                 mp_ctx = multiprocessing.get_context('fork')
             except ValueError as e:
                 raise RuntimeError('当前平台不支持 fork, PIL 子进程渲染池不可用') from e
-            # fork 继承已加载的插件模块, 子进程可直接执行插件的渲染函数
-            pool = ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx, initializer=close_inherited_listen_sockets)
+            # 子进程继承已加载的插件模块，可直接执行插件函数。
+            pool = ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=mp_ctx,
+                initializer=close_inherited_listen_sockets,
+            )
             if resident:
                 self._resident = pool
                 if self._cfg.get('resident_idle_timeout', 0):
@@ -192,16 +195,20 @@ class PILRenderPool(IdleEngine):
 
     async def _release_idle(self):
         """空闲超时按各自阈值回收弹性池与常驻池"""
-        elapsed = time.monotonic() - self._last_release
-        if self._burst is not None and elapsed >= self._cfg.get('idle_timeout', 300):
-            await self._discard(self._burst)
-            log.info('PIL 弹性渲染进程池空闲回收')
-        resident_timeout = self._cfg.get('resident_idle_timeout', 0)
-        if resident_timeout and self._resident is not None and elapsed >= resident_timeout:
-            pool = self._resident
-            self._resident_tasks = 0
-            await self._discard(pool)
-            log.info('PIL 常驻渲染进程池空闲回收')
+        async with self._lifecycle_lock:
+            # 再次检查活动任务，避免调度间隙误杀新任务。
+            if self._active != 0:
+                return
+            elapsed = time.monotonic() - self._last_release
+            if self._burst is not None and elapsed >= self._cfg.get('idle_timeout', 300):
+                await self._discard(self._burst)
+                log.info('PIL 弹性渲染进程池空闲回收')
+            resident_timeout = self._cfg.get('resident_idle_timeout', 0)
+            if resident_timeout and self._resident is not None and elapsed >= resident_timeout:
+                pool = self._resident
+                self._resident_tasks = 0
+                await self._discard(pool)
+                log.info('PIL 常驻渲染进程池空闲回收')
 
     async def close(self):
         self._closed = True
