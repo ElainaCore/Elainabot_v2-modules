@@ -25,11 +25,11 @@ from modules.renderer.pil.worker import execute
 log = get_logger(EXTENSION, 'PIL渲染池')
 
 _DEFAULTS = {
-    'max_workers': 2,
+    'max_workers': 4,
     'max_concurrent': 4,
     'idle_timeout': 300,
     'task_timeout': 60,
-    'max_tasks_per_worker': 300,
+    'max_tasks_per_worker': 100,
 }
 
 _COMMENTS = {
@@ -37,7 +37,7 @@ _COMMENTS = {
     'max_concurrent': '最大并发渲染任务数 (超出排队)',
     'idle_timeout': '整个渲染池空闲回收 (秒), 0=不回收',
     'task_timeout': '单次渲染超时 (秒)',
-    'max_tasks_per_worker': '按 worker 数折算整池任务阈值, 空闲间隙重建释放内存, 0=不重建',
+    'max_tasks_per_worker': '单个 worker 完成任务上限后自动轮换释放内存, 0=不轮换',
 }
 
 
@@ -69,12 +69,11 @@ def _make_request(target, args, kwargs):
 class PILRenderPool(IdleEngine):
     """按需扩容、空闲回收并自动轮换 worker 的 PIL 渲染池。"""
 
-    __slots__ = ('_pool', '_pool_tasks', '_lifecycle_lock', '_start_method', '_mp_context')
+    __slots__ = ('_pool', '_lifecycle_lock', '_start_method', '_mp_context')
 
     def __init__(self, cfg):
         super().__init__(cfg, cfg.get('max_concurrent', 4))
         self._pool = None
-        self._pool_tasks = 0
         self._start_method, self._mp_context = _clean_process_context()
         # 用同一把锁保护任务进入和进程池回收，避免回收竞态。
         self._lifecycle_lock = asyncio.Lock()
@@ -94,7 +93,6 @@ class PILRenderPool(IdleEngine):
                 async with self._lifecycle_lock:
                     self._active -= 1
                     self._mark_released()
-                    await self._maybe_recycle_pool()
 
     async def _run_in_pool(self, request, retried):
         pool = await self._ensure_pool()
@@ -102,9 +100,7 @@ class PILRenderPool(IdleEngine):
         timeout = self._cfg.get('task_timeout', 60)
         try:
             fut = loop.run_in_executor(pool, execute, request)
-            result = await asyncio.wait_for(fut, timeout=timeout)
-            self._pool_tasks += 1
-            return result
+            return await asyncio.wait_for(fut, timeout=timeout)
         except TimeoutError:
             # 卡住的进程无法随 future 取消，直接回收整个池。
             fut.cancel()
@@ -128,14 +124,17 @@ class PILRenderPool(IdleEngine):
                 return pool
             workers = max(1, int(self._cfg.get('max_workers', 2)))
             task_limit = max(0, int(self._cfg.get('max_tasks_per_worker', 300)))
-            pool = ProcessPoolExecutor(max_workers=workers, mp_context=self._mp_context)
+            pool = ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=self._mp_context,
+                max_tasks_per_child=task_limit or None,
+            )
             self._pool = pool
-            self._pool_tasks = 0
             if self._cfg.get('idle_timeout', 0):
                 self._start_idle_cleanup(60)
             log.info(
                 f'PIL 渲染进程池已创建 ({workers} worker, {self._start_method}, '
-                f'回收阈值 {task_limit * workers if task_limit else "不限"} 任务)'
+                f'每 worker {task_limit or "不限"} 任务后轮换)'
             )
             return pool
 
@@ -154,20 +153,6 @@ class PILRenderPool(IdleEngine):
                 with contextlib.suppress(Exception):
                     process.kill()
         await asyncio.to_thread(pool.shutdown, wait=True, cancel_futures=True)
-
-    async def _maybe_recycle_pool(self):
-        per_worker = max(0, int(self._cfg.get('max_tasks_per_worker', 300)))
-        workers = max(1, int(self._cfg.get('max_workers', 2)))
-        if (
-            per_worker
-            and self._active == 0
-            and self._pool is not None
-            and self._pool_tasks >= per_worker * workers
-        ):
-            pool = self._pool
-            completed = self._pool_tasks
-            await self._discard(pool)
-            log.info(f'PIL 渲染进程池累计 {completed} 个任务后回收')
 
     async def _release_idle(self):
         """整个进程池空闲超时后回收。"""

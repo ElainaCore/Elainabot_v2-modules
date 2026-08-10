@@ -6,7 +6,7 @@ import gc
 import importlib
 from functools import lru_cache
 
-_TRIM_EVERY = 16
+_TRIM_EVERY = 4
 _task_count = 0
 _initialized = False
 

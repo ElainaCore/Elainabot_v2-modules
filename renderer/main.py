@@ -24,7 +24,7 @@
 __module_meta__ = {
     'name': '渲染引擎',
     'description': 'PIL 子进程渲染池 + Playwright 浏览器渲染统一管理, 全局共享按需启停',
-    'version': '2.2.2',
+    'version': '2.2.3',
     'author': 'ElainaBot',
 }
 
@@ -105,12 +105,10 @@ async def setup(ctx):
 
     parts = []
     if pil_inst:
-        recycle_limit = (
-            pil_cfg.get('max_tasks_per_worker', 300) * pil_cfg['max_workers']
-        )
+        recycle_limit = pil_cfg.get('max_tasks_per_worker', 300)
         parts.append(
             f'PIL ✅ [最大 {pil_cfg["max_workers"]} worker / {pil_inst.start_method}'
-            f' / 整池 {recycle_limit or "不限制"} 任务后回收]'
+            f' / 每 worker {recycle_limit or "不限制"} 任务后轮换]'
         )
     elif cfg.get('pil_enabled'):
         parts.append('PIL ❌')
