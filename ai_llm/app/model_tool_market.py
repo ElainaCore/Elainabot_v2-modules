@@ -1,10 +1,13 @@
-"""Model tool marketplace using the framework GitHub mirror pipeline."""
+"""通过框架镜像管理模型工具市场。"""
 from __future__ import annotations
 
 import io
+import asyncio
+import copy
 import json
 import os
 import re
+import time
 import zipfile
 
 from web.tools._market.fetch import _download_file
@@ -18,44 +21,57 @@ from .model_tool_store import ModelToolFileError, ModelToolStore
 
 CATALOG_URL = 'https://raw.githubusercontent.com/ElainaCore/Elaina-plugins/main/tools.json'
 _SAFE_PATH = re.compile(r'^(?!/)(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9_.\-/]+$')
+_CACHE_TTL = 300
+_catalog_cache: list[dict] = []
+_catalog_cached_at = 0.0
+_catalog_lock: asyncio.Lock | None = None
+
+def _summary(value, limit: int = 120) -> str:
+    return ' '.join(str(value or '').split())[:limit]
 
 
-async def catalog() -> list[dict]:
-    content = await _download_file(CATALOG_URL, mirror=get_github_mirror())
-    if not content:
-        raise ModelToolFileError('模型工具清单获取失败')
-    try:
-        value = json.loads(content)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ModelToolFileError('模型工具清单格式无效') from error
-    rows = value if isinstance(value, list) else value.get('tools', [])
-    result = []
-    for raw in rows if isinstance(rows, list) else []:
-        if not isinstance(raw, dict):
-            continue
-        tool_id = str(raw.get('id') or '').strip().casefold()
-        github = str(raw.get('github') or '').strip().rstrip('/')
-        path = str(raw.get('path') or '').strip().strip('/').replace('\\', '/')
-        kind = str(raw.get('type') or 'file').strip().casefold()
-        if (
-            not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', tool_id)
-            or not re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', github)
-            or not _SAFE_PATH.fullmatch(path)
-            or kind not in {'file', 'folder'}
-        ):
-            continue
-        result.append({
-            'id': tool_id,
-            'name': str(raw.get('name') or tool_id).strip()[:100],
-            'description': str(raw.get('description') or '').strip()[:500],
-            'author': str(raw.get('author') or '').strip()[:100],
-            'version': str(raw.get('version') or '').strip()[:50],
-            'github': github,
-            'branch': str(raw.get('branch') or 'main').strip()[:100],
-            'path': path,
-            'type': kind,
-        })
-    return result
+async def catalog(force: bool = False) -> list[dict]:
+    global _catalog_cache, _catalog_cached_at, _catalog_lock
+    if not force and _catalog_cache and time.monotonic() - _catalog_cached_at < _CACHE_TTL:
+        return copy.deepcopy(_catalog_cache)
+    if _catalog_lock is None:
+        _catalog_lock = asyncio.Lock()
+    async with _catalog_lock:
+        if not force and _catalog_cache and time.monotonic() - _catalog_cached_at < _CACHE_TTL:
+            return copy.deepcopy(_catalog_cache)
+        content = await _download_file(CATALOG_URL, mirror=get_github_mirror())
+        if not content:
+            raise ModelToolFileError('模型工具清单获取失败')
+        try:
+            value = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ModelToolFileError('模型工具清单格式无效') from error
+        rows = value if isinstance(value, list) else value.get('tools', [])
+        result = []
+        for raw in rows if isinstance(rows, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            tool_id = str(raw.get('id') or '').strip().casefold()
+            github = str(raw.get('github') or '').strip().rstrip('/')
+            path = str(raw.get('path') or '').strip().strip('/').replace('\\', '/')
+            kind = str(raw.get('type') or 'file').strip().casefold()
+            if (
+                not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', tool_id)
+                or not re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', github)
+                or not _SAFE_PATH.fullmatch(path)
+                or kind not in {'file', 'folder'}
+            ):
+                continue
+            result.append({
+                'id': tool_id, 'name': _summary(raw.get('name') or tool_id, 100),
+                'description': _summary(raw.get('description')),
+                'version': str(raw.get('version') or '').strip()[:50],
+                'github': github, 'branch': str(raw.get('branch') or 'main').strip()[:100],
+                'path': path, 'type': kind,
+            })
+        _catalog_cache = result
+        _catalog_cached_at = time.monotonic()
+        return copy.deepcopy(result)
 
 
 def _folder_archive(content: bytes, path: str) -> bytes:

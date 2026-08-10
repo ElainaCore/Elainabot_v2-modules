@@ -1,4 +1,4 @@
-"""Public entry points for the shared AI service module."""
+"""提供 AI 服务的公共入口。"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -8,7 +8,7 @@ if TYPE_CHECKING:
 
 
 def get_service() -> AIService | None:
-    """Return the running shared AI service, or ``None`` when disabled."""
+    """返回运行中的 AI 服务，未启用时返回 None。"""
     try:
         from core.application import get_app
 

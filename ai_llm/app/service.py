@@ -1,4 +1,4 @@
-"""Shared OpenAI-compatible LLM service for ElainaBot plugins."""
+"""提供兼容 OpenAI 的统一模型服务。"""
 from __future__ import annotations
 
 import asyncio
@@ -32,13 +32,13 @@ class AIServiceError(RuntimeError):
 
 
 class AIProviderError(AIServiceError):
-    """A provider transport or protocol failure eligible for failover."""
+    """表示可触发故障切换的接口错误。"""
 
     pass
 
 
 class AIExecutionIncomplete(AIServiceError):
-    """The provider answered, but an agent task did not finish its required actions."""
+    """表示 Agent 未完成必要操作。"""
 
     execution_incomplete = True
 
@@ -78,12 +78,7 @@ def _xml_element_value(element: ElementTree.Element):
 
 
 def _xml_tool_calls(content: str, tools: list[dict] | None) -> tuple[list[dict], str]:
-    """Convert XML-style calls emitted by some compatible endpoints into tool calls.
-
-    Only names present in the supplied tool schema are accepted. Complete XML blocks
-    are parsed with ElementTree; a bare opening tag is accepted only for a tool with
-    no required arguments.
-    """
+    """将兼容接口返回的受限 XML 转为工具调用。"""
     if not content or not tools or '<' not in content:
         return [], content
     definitions = {}
@@ -146,7 +141,7 @@ def _xml_tool_calls(content: str, tools: list[dict] | None) -> tuple[list[dict],
 
 
 def _text_tool_protocol(tools: list[dict] | None) -> str:
-    """Describe a constrained XML fallback for models without function calling."""
+    """生成不支持函数调用时的 XML 工具协议。"""
     definitions = []
     for item in tools or []:
         function = item.get('function', {}) if isinstance(item, dict) else {}
@@ -681,7 +676,7 @@ class AIService:
         return self._capability_handlers.get(str(key or ''))
 
     def model_tool_catalog(self, consumer_plugin: str = '') -> list[dict]:
-        """List centrally installed model-callable tools."""
+        """返回已安装且可供模型调用的工具。"""
         permissions = self._config.get('model_tool_permissions', {})
         return [
             {
@@ -879,7 +874,7 @@ class AIService:
             self._save_callback(self._config)
 
     def list_capabilities(self, consumer_plugin: str, kind: str = '') -> list[dict]:
-        """List online capabilities that a plugin may discover and call."""
+        """返回插件可发现和调用的在线能力。"""
         result = []
         for item in self.plugin_capabilities(
             consumer_plugin=consumer_plugin, kind=str(kind or '').lower(),
@@ -905,7 +900,7 @@ class AIService:
     async def discover_capabilities(
         self, consumer_plugin: str, kind: str = '',
     ) -> list[dict]:
-        """Discover callable capabilities, including tools exposed by MCP entries."""
+        """发现可调用能力及其 MCP 工具。"""
         result = self.list_capabilities(consumer_plugin, kind)
         if not kind or str(kind).lower() == 'mcp':
             discovered = await self.runtime.refresh_plugin_mcp_tools(consumer_plugin)
@@ -928,7 +923,7 @@ class AIService:
     async def call_capability(
         self, consumer_plugin: str, capability_key: str, arguments: dict | None = None,
     ):
-        """Call an allowed capability by the key returned from discover_capabilities()."""
+        """通过能力标识调用已授权能力。"""
         arguments = arguments if isinstance(arguments, dict) else {}
         item = next((value for value in self.plugin_capabilities(
             consumer_plugin=consumer_plugin,
@@ -962,10 +957,45 @@ class AIService:
             return {'ok': False, 'error': 'MCP 工具不存在或服务当前不可用'}
         return {'ok': False, 'error': '不支持的能力类型'}
 
-    def config(self, *, public: bool = False) -> dict:
-        result = copy.deepcopy(self._config)
-        if public:
-            for provider in result['providers']:
+    def config(self, *, public: bool = False, section: str = '') -> dict:
+        sections = {
+            'overview': (
+                'enabled', 'auto_switch', 'auto_fetch_models', 'request_timeout',
+                'temperature', 'max_tokens', 'max_tool_rounds', 'model_tools_enabled',
+                'audit_include_content',
+            ),
+            'providers': ('active_provider', 'providers'),
+            'context': ('runtime_prompt', 'context'),
+            'skills': ('skills',),
+            'model-tools': ('model_tool_permissions',),
+            'mcp': ('mcp',),
+            'cron': ('cron_jobs',),
+            'test': ('active_provider', 'providers'),
+            'logs': (),
+        }
+        section = str(section or '').strip().lower()
+        fields = sections.get(section)
+        result = (
+            {key: copy.deepcopy(self._config.get(key)) for key in fields}
+            if fields is not None else copy.deepcopy(self._config)
+        )
+        if section == 'overview':
+            providers = self._config.get('providers', [])
+            enabled = [item for item in providers if item.get('enabled')]
+            result['metrics'] = {
+                'providers': len(enabled),
+                'models': sum(
+                    len(set(item.get('models', [])) - set(item.get('disabled_models', [])))
+                    for item in enabled
+                ),
+            }
+        elif section == 'logs':
+            result['providers'] = [
+                {'id': item.get('id'), 'name': item.get('name')}
+                for item in self._config.get('providers', [])
+            ]
+        if public and section != 'logs':
+            for provider in result.get('providers', []):
                 provider['api_key_set'] = bool(provider.get('api_key'))
                 provider['api_key'] = '********' if provider['api_key_set'] else ''
                 saved_health = provider.get('health', {})
@@ -977,11 +1007,14 @@ class AIService:
                 headers = server.get('headers', {})
                 server['headers_set'] = bool(headers)
                 server['headers'] = {key: '********' for key in headers}
-            result['runtime_status'] = self.runtime.status()
-            result['plugin_capabilities'] = self.plugin_capabilities(public=True)
+            if fields is None:
+                result['runtime_status'] = self.runtime.status()
+                result['plugin_capabilities'] = self.plugin_capabilities(public=True)
+            elif section == 'overview':
+                result['runtime_status'] = self.runtime.status(details=False)
         return result
 
-    async def save(self, incoming: dict) -> dict:
+    async def save(self, incoming: dict, *, section: str = '') -> dict:
         async with self._lock:
             value = copy.deepcopy(incoming) if isinstance(incoming, dict) else {}
             old = {item['id']: item for item in self._config['providers']}
@@ -1000,7 +1033,7 @@ class AIService:
                 server.pop('headers_set', None)
             merged = copy.deepcopy(self._config)
             if 'cron_jobs' in value and isinstance(value.get('cron_jobs'), list):
-                # Panel saves edit administrative jobs only; message-created reminders survive.
+                # 面板只覆盖管理任务，保留消息创建的提醒。
                 user_jobs = [
                     copy.deepcopy(item) for item in self._config.get('cron_jobs', [])
                     if isinstance(item, dict) and item.get('source') == 'model_tool'
@@ -1017,14 +1050,14 @@ class AIService:
             self._config = normalize_config(merged)
             self.audit.set_include_content(self._config.get('audit_include_content', False))
             self._save_callback(self._config)
-            return self.config(public=True)
+            return self.config(public=True, section=section)
 
     def _provider(self, provider_id: str = '') -> dict | None:
         target = provider_id or self._config['active_provider']
         return next((item for item in self._config['providers'] if item['id'] == target and item['enabled']), None)
 
     def available(self) -> bool:
-        """Return whether the service has at least one enabled, usable model."""
+        """检查服务是否至少有一个可用模型。"""
         return bool(self._config.get('enabled') and self._candidates())
 
     def _candidates(self, provider_id: str = '', model: str = '') -> list[tuple[dict, str]]:
@@ -1112,7 +1145,7 @@ class AIService:
     async def moderate(
         self, text: str, *, provider_id: str = '', model: str = 'omni-moderation-latest',
     ) -> dict:
-        """Run the provider's dedicated OpenAI-compatible Moderation API."""
+        """调用接口的内容审核服务。"""
         provider = self._provider(provider_id)
         if provider is None:
             raise AIServiceError('没有可用的内容审核接口')
@@ -1152,7 +1185,7 @@ class AIService:
         self, prompt: str, *, candidates: list[dict], size: str = '1024x1024',
         reference_image: bytes | None = None,
     ) -> dict:
-        """Generate one image and fail over across an explicit provider/model route."""
+        """按指定路由生成图片并自动切换故障接口。"""
         value = str(prompt or '').strip()
         if not value:
             raise AIServiceError('生图描述不能为空')
@@ -1780,7 +1813,7 @@ class AIService:
             self.runtime.finish_run(run_id, error_text)
 
     async def run_agent(self, messages: list[dict], **kwargs) -> dict:
-        """Run an explicit agent loop with central runtime capabilities enabled."""
+        """启用中央运行能力并执行 Agent。"""
         kwargs['enable_runtime_tools'] = True
         return await self.complete(messages, **kwargs)
 
@@ -1816,13 +1849,11 @@ class AIService:
                     payload.get('tool_choice') == 'required'
                     and 'tool_choice' in error_text
                 ):
-                    # Some OpenAI-compatible gateways only accept "auto". The
-                    # completion validator still prevents a prose-only success.
+                    # 部分兼容接口仅接受 auto，完成校验仍会阻止纯文本误报成功。
                     payload['tool_choice'] = 'auto'
                     data = await self._request(provider, payload, run_id)
                 elif 'tools' in payload and _tools_parameter_unsupported(error_text):
-                    # Keep the local schemas for XML parsing, but stop sending native
-                    # function-calling fields to endpoints that reject them.
+                    # 保留本地结构用于 XML 解析，但不再向不兼容接口发送工具字段。
                     payload.pop('tools', None)
                     payload.pop('tool_choice', None)
                     data = await self._request(provider, payload, run_id)

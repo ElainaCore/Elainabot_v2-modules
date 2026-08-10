@@ -60,7 +60,7 @@ export async function streamApi(path, body, onEvent) {
   buffer += decoder.decode();
   if (buffer.trim()) consume(buffer);
 }
-export function setState(value) { state = value || {}; return state; }
+export function setState(value) { state = {...state, ...(value || {})}; return state; }
 export function setSkills(value) { skills = Array.isArray(value) ? value : []; }
 export function setModelTools(value) { modelTools = Array.isArray(value) ? value : []; }
 export function setModelToolMarket(value) { modelToolMarket = Array.isArray(value) ? value : []; }
@@ -85,11 +85,13 @@ function field(key, value, type = 'text') {
 }
 function modelToolCard(item) {
   const permission = (state.model_tool_permissions || {})[item.id] === 'owner' ? 'owner' : 'all';
-  return '<article class="model-tool-card"><div class="model-tool-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '无描述') + '</small><div class="model-tool-meta"><code>' + esc(item.id) + '</code><span>' + esc(item.kind === 'folder' ? '文件夹' : '单文件') + '</span></div><label class="model-tool-permission"><span>调用权限</span><select data-model-tool-permission="' + esc(item.id) + '"><option value="all"' + (permission === 'all' ? ' selected' : '') + '>所有人</option><option value="owner"' + (permission === 'owner' ? ' selected' : '') + '>仅主人</option></select></label></div><button class="btn danger delete-model-tool" data-tool-id="' + esc(item.id) + '" type="button">删除</button></article>';
+  const folderTag = item.kind === 'folder' ? '<span>文件夹</span>' : '';
+  return '<article class="model-tool-card"><div class="model-tool-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '暂无简介') + '</small><div class="model-tool-meta"><code>' + esc(item.id) + '</code>' + folderTag + '</div><label class="model-tool-permission"><span>调用权限</span><select data-model-tool-permission="' + esc(item.id) + '"><option value="all"' + (permission === 'all' ? ' selected' : '') + '>所有人</option><option value="owner"' + (permission === 'owner' ? ' selected' : '') + '>仅主人</option></select></label></div><button class="btn danger delete-model-tool" data-tool-id="' + esc(item.id) + '" type="button">删除</button></article>';
 }
 function marketModelToolCard(item) {
   const installed = !!item.installed;
-  return '<article class="model-tool-card"><div class="model-tool-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '无描述') + '</small><div class="model-tool-meta"><code>' + esc(item.id) + '</code><span>' + esc(item.author || '未知作者') + '</span><span>v' + esc(item.version || '-') + '</span><span>' + esc(item.type === 'folder' ? '文件夹' : '单文件') + '</span></div></div><button class="btn '+ (installed ? '' : 'primary') + ' install-model-tool" data-tool-id="' + esc(item.id) + '" type="button" '+ (installed ? 'disabled' : '') + '>' + (installed ? '已安装' : '下载') + '</button></article>';
+  const folderTag = item.type === 'folder' ? '<span>文件夹</span>' : '';
+  return '<article class="model-tool-card"><div class="model-tool-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '暂无简介') + '</small><div class="model-tool-meta"><code>' + esc(item.id) + '</code><span>v' + esc(item.version || '-') + '</span>' + folderTag + '</div></div><button class="btn '+ (installed ? '' : 'primary') + ' install-model-tool" data-tool-id="' + esc(item.id) + '" type="button" '+ (installed ? 'disabled' : '') + '>' + (installed ? '已安装' : '下载') + '</button></article>';
 }
 export function mcpTemplate(item) {
   const headers = JSON.stringify(item.headers || {}, null, 2);
@@ -126,9 +128,6 @@ export function readItems(selector) {
     return item;
   });
 }
-export function collectCommon() {
-  return {enabled: $('enabled').checked, model_tools_enabled: $('model_tools_enabled').checked, auto_switch: $('auto_switch').checked, auto_fetch_models: $('auto_fetch_models').checked, audit_include_content: $('audit_include_content').checked, temperature: Number($('temperature').value), max_tokens: Number($('max_tokens').value), max_tool_rounds: Number($('max_tool_rounds').value), request_timeout: Number($('request_timeout').value), runtime_prompt: $('runtime_prompt').value, context: {max_tokens: Number($('context_max_tokens').value), max_turns: Number($('context_max_turns').value), keep_recent_ratio: Number($('context_keep_ratio').value), compress_enabled: $('context_compress').checked}, skills: {enabled: $('skills_enabled').checked, enabled_ids: [...document.querySelectorAll('[data-skill-id]:checked')].map(node => node.dataset.skillId)}, mcp: {enabled: $('mcp_enabled').checked, servers: readItems('#mcp-list .item')}, cron_jobs: readItems('#cron-list .item')};
-}
 export function readModelToolPermissions() {
   const permissions = {...(state.model_tool_permissions || {})};
   document.querySelectorAll('[data-model-tool-permission]').forEach(select => {
@@ -137,12 +136,11 @@ export function readModelToolPermissions() {
   return permissions;
 }
 export function sectionPayload(section) {
-  const common = collectCommon();
-  if (section === 'overview') return {enabled: common.enabled, model_tools_enabled: common.model_tools_enabled, auto_switch: common.auto_switch, auto_fetch_models: common.auto_fetch_models, audit_include_content: common.audit_include_content, temperature: common.temperature, max_tokens: common.max_tokens, max_tool_rounds: common.max_tool_rounds, request_timeout: common.request_timeout};
-  if (section === 'context') return {runtime_prompt: common.runtime_prompt, context: common.context};
-  if (section === 'skills') return {skills: common.skills};
-  if (section === 'mcp') return {mcp: common.mcp};
-  if (section === 'cron') return {cron_jobs: common.cron_jobs};
+  if (section === 'overview') return {enabled: $('enabled').checked, model_tools_enabled: $('model_tools_enabled').checked, auto_switch: $('auto_switch').checked, auto_fetch_models: $('auto_fetch_models').checked, audit_include_content: $('audit_include_content').checked, temperature: Number($('temperature').value), max_tokens: Number($('max_tokens').value), max_tool_rounds: Number($('max_tool_rounds').value), request_timeout: Number($('request_timeout').value)};
+  if (section === 'context') return {runtime_prompt: $('runtime_prompt').value, context: {max_tokens: Number($('context_max_tokens').value), max_turns: Number($('context_max_turns').value), keep_recent_ratio: Number($('context_keep_ratio').value), compress_enabled: $('context_compress').checked}};
+  if (section === 'skills') return {skills: {enabled: $('skills_enabled').checked, enabled_ids: [...document.querySelectorAll('[data-skill-id]:checked')].map(node => node.dataset.skillId)}};
+  if (section === 'mcp') return {mcp: {enabled: $('mcp_enabled').checked, servers: readItems('#mcp-list .item')}};
+  if (section === 'cron') return {cron_jobs: readItems('#cron-list .item')};
   if (section === 'model-tools') return {model_tool_permissions: readModelToolPermissions()};
   return {};
 }
@@ -161,10 +159,9 @@ export function renderCommon(page = 'overview') {
     ['enabled', 'model_tools_enabled', 'auto_switch', 'auto_fetch_models', 'audit_include_content'].forEach(key => $(key).checked = !!state[key]);
     ['temperature', 'max_tokens', 'max_tool_rounds', 'request_timeout'].forEach(key => $(key).value = state[key] ?? '');
   }
-  const enabled = (state.providers || []).filter(item => item.enabled);
   if (page === 'overview') {
-    $('m-providers').textContent = enabled.length;
-    $('m-models').textContent = enabled.reduce((sum, item) => sum + (item.models || []).filter(model => !(item.disabled_models || []).includes(model)).length, 0);
+    $('m-providers').textContent = state.metrics?.providers ?? 0;
+    $('m-models').textContent = state.metrics?.models ?? 0;
     $('m-runs').textContent = state.runtime_status?.running ?? 0;
     $('m-tools').textContent = state.runtime_status?.mcp_tools ?? 0;
   } else if (page === 'context') {
@@ -202,8 +199,7 @@ export function renderTestModels() {
   const models = provider ? orderedModels(provider).filter(model => !(provider.disabled_models || []).includes(model)) : [];
   $('test-model').innerHTML = '<option value="">默认 / 自动</option>' + models.map(model => '<option value="' + esc(model) + '">' + esc(model) + '</option>').join('');
 }
-export async function loadConfig() {
-  const result = await Promise.all([api('/config'), api('/skills').catch(() => []), api('/tools').catch(() => []), api('/tools/market').catch(() => [])]);
-  setState(result[0]); setSkills(result[1]); setModelTools(result[2]); setModelToolMarket(result[3]); return state;
+export async function loadConfig(section = 'overview') {
+  return setState(await api('/config?section=' + encodeURIComponent(section)));
 }
-export async function saveSection(section) { setState(await api('/config', {method: 'PUT', body: JSON.stringify(sectionPayload(section))})); }
+export async function saveSection(section) { setState(await api('/config?section=' + encodeURIComponent(section), {method: 'PUT', body: JSON.stringify(sectionPayload(section))})); }

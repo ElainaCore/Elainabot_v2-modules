@@ -1,4 +1,4 @@
-"""One-time import of the legacy ai_dev endpoint configuration."""
+"""迁移旧版 ai_dev 接口配置。"""
 from __future__ import annotations
 
 import copy
@@ -43,7 +43,7 @@ def load_ai_dev_config(
     settings_get: Callable[[str, object], object] | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> dict | None:
-    """Build central config from ai_dev files without importing that plugin."""
+    """从 ai_dev 文件生成中央配置。"""
     plugin_dir = next(
         (
             path for path in (

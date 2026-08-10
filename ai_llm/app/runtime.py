@@ -1,4 +1,4 @@
-"""Agent runtime capabilities for the shared AI service."""
+"""管理 AI 服务的 Agent 运行能力。"""
 from __future__ import annotations
 
 import asyncio
@@ -90,24 +90,49 @@ class AgentRuntime:
         self._cron_task: asyncio.Task | None = None
         self._cron_seen: dict[str, float] = {}
         self._emit = None
+        self._skills_cache_key = None
+        self._skills_cache: list[dict] = []
 
-    def status(self) -> dict:
+    def status(self, details: bool = True) -> dict:
         running = sum(1 for item in self._runs.values() if item['status'] == 'running')
-        runs = []
-        for item in list(self._runs.values())[-30:]:
-            runs.append({key: copy.deepcopy(value) for key, value in item.items() if key != 'task'})
-        return {
+        result = {
             'running': running,
-            'runs': runs,
-            'skills': self.skills(),
             'mcp_tools': len(self._mcp_tools) + sum(
                 len(items) for items in self._plugin_mcp_tools.values()
             ),
-            'mcp_errors': copy.deepcopy(self._mcp_errors),
             'cron_active': bool(self._cron_task and not self._cron_task.done()),
         }
+        if details:
+            result['runs'] = [
+                {key: copy.deepcopy(value) for key, value in item.items() if key != 'task'}
+                for item in list(self._runs.values())[-30:]
+            ]
+            result['skills'] = self.skills()
+            result['mcp_errors'] = copy.deepcopy(self._mcp_errors)
+        return result
+
+    def _skills_signature(self):
+        signature = []
+        try:
+            entries = os.scandir(self.skills_dir)
+        except OSError:
+            return ()
+        with entries:
+            for entry in entries:
+                if not entry.is_dir(follow_symlinks=False) or not _SKILL_ID.fullmatch(entry.name):
+                    continue
+                path = os.path.join(entry.path, 'SKILL.md')
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                signature.append((entry.name, stat.st_mtime_ns, stat.st_size))
+        return tuple(sorted(signature))
 
     def skills(self) -> list[dict]:
+        signature = self._skills_signature()
+        if signature == self._skills_cache_key:
+            return copy.deepcopy(self._skills_cache)
         result = []
         if not os.path.isdir(self.skills_dir):
             return result
@@ -132,10 +157,12 @@ class AgentRuntime:
             except OSError:
                 continue
             result.append({'id': skill_id, 'name': name, 'description': description})
-        return result
+        self._skills_cache_key = signature
+        self._skills_cache = result
+        return copy.deepcopy(result)
 
     def install_skill(self, filename: str, content: bytes, skill_id: str = '') -> dict:
-        """Install a SKILL.md or a safely-contained skill zip archive."""
+        """安装 SKILL.md 或安全的 Skill 压缩包。"""
         if not content:
             raise RuntimeCapabilityError('上传文件为空')
         if len(content) > _SKILL_UPLOAD_LIMIT:
@@ -176,7 +203,7 @@ class AgentRuntime:
                         parts = [part for part in normalized.split('/') if part not in ('', '.')]
                         if not parts or '..' in parts or os.path.isabs(item.filename):
                             raise RuntimeCapabilityError('Skill 压缩包包含不安全路径')
-                        # Unix symlinks are not accepted.
+                        # 禁止 Unix 符号链接。
                         if (item.external_attr >> 16) & 0o170000 == 0o120000:
                             raise RuntimeCapabilityError('Skill 压缩包不能包含符号链接')
                         paths.append((item, parts))

@@ -4,12 +4,12 @@
 通过配置文件独立开关两个渲染子引擎, 全局共享, 插件不必各自开渲染池。
 启用了某个子引擎但其依赖未安装时报错并标记不可用, 不影响模块整体加载。
 
-插件中获取:
-    rd = bot.module_manager.get("renderer")
+插件中使用 PIL 专用协议:
+    from modules.renderer.protocol import render_pil
 
-    # PIL 子进程渲染 (渲染函数须为模块级函数, 参数与返回值可 pickle)
-    if rd.pil_available():
-        img_data, w, h = await rd.pil.render(_render_sync, arg1, arg2)
+    img_data, w, h = await render_pil(
+        'plugins.example.render:render_card', arg1, arg2
+    )
 
     # Playwright 浏览器渲染
     if rd.playwright_available():
@@ -24,7 +24,7 @@
 __module_meta__ = {
     'name': '渲染引擎',
     'description': 'PIL 子进程渲染池 + Playwright 浏览器渲染统一管理, 全局共享按需启停',
-    'version': '2.0.1',
+    'version': '2.0.2',
     'author': 'ElainaBot',
 }
 
@@ -70,11 +70,17 @@ async def setup(ctx):
     from modules.renderer.pil.main import _COMMENTS as PIL_COMMENTS
     from modules.renderer.pil.main import _DEFAULTS as PIL_DEFAULTS
     from modules.renderer.pil.main import PILRenderPool
+    from modules.renderer.protocol import _bind_pil_pool
     from modules.renderer.playwright.main import _COMMENTS as PW_COMMENTS
     from modules.renderer.playwright.main import _DEFAULTS as PW_DEFAULTS
     from modules.renderer.playwright.main import PlaywrightRenderer
 
     pil_cfg = ctx.ensure_config(PIL_DEFAULTS, filename='pil.yaml', comments=PIL_COMMENTS)
+    legacy_keys = ('min_workers', 'resident_idle_timeout', 'start_method')
+    if any(key in pil_cfg for key in legacy_keys):
+        pil_cfg = {key: value for key, value in pil_cfg.items() if key not in legacy_keys}
+        ctx.save_config(pil_cfg, filename='pil.yaml', comments=PIL_COMMENTS)
+        log.info('已移除 PIL 旧版双池配置')
     pw_cfg = ctx.ensure_config(PW_DEFAULTS, filename='playwright.yaml', comments=PW_COMMENTS)
 
     pil_inst = None
@@ -95,10 +101,17 @@ async def setup(ctx):
             pw_inst = PlaywrightRenderer(pw_cfg)
 
     _instance = Renderer(pil_inst, pw_inst)
+    _bind_pil_pool(pil_inst)
 
     parts = []
     if pil_inst:
-        parts.append(f'PIL ✅ [常驻 {pil_cfg["min_workers"]} / 最大 {pil_cfg["max_workers"]} worker]')
+        recycle_limit = (
+            pil_cfg.get('max_tasks_per_worker', 300) * pil_cfg['max_workers']
+        )
+        parts.append(
+            f'PIL ✅ [最大 {pil_cfg["max_workers"]} worker / {pil_inst.start_method}'
+            f' / 整池 {recycle_limit or "不限制"} 任务后回收]'
+        )
     elif cfg.get('pil_enabled'):
         parts.append('PIL ❌')
     else:
@@ -117,9 +130,12 @@ async def setup(ctx):
 
 async def teardown():
     global _instance
-    if _instance:
-        await _instance.close()
-        _instance = None
+    from modules.renderer.protocol import _bind_pil_pool
+
+    instance, _instance = _instance, None
+    _bind_pil_pool(None)
+    if instance:
+        await instance.close()
 
 
 # ==================== Renderer ====================

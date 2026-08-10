@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/api/ext/ai-service/assets/panel.css">
 </head>
 <body>
-  <div class="app" id="app">
-    <aside class="sidebar">
+  <div class="app sidebar-collapsed" id="app">
+    <button class="sidebar-scrim" id="sidebar-scrim" type="button" aria-label="关闭侧边栏"></button>
+    <aside class="sidebar" aria-label="AI LLM 服务侧边栏">
       <div class="brand"><div class="logo">LLM</div><div><strong>AI LLM 服务</strong><small>Providers &amp; Model Tools</small></div></div>
       <nav class="nav" aria-label="AI LLM 服务导航">
         <button class="active" data-page="overview"><i>01</i><span>概览</span></button>
@@ -27,7 +28,7 @@
     </aside>
     <main class="workspace">
       <header class="topbar">
-        <div class="heading"><button class="icon-btn" id="sidebar-toggle" type="button" title="收起侧边栏" aria-label="收起侧边栏">≡</button><div><h1 id="page-title">概览</h1><p>统一接口、模型优先级与模型工具</p></div></div>
+        <div class="heading"><button class="icon-btn" id="sidebar-toggle" type="button" title="展开侧边栏" aria-label="展开侧边栏" aria-expanded="false">☰</button><div><h1 id="page-title">概览</h1><p>统一接口、模型优先级与模型工具</p></div></div>
         <div class="actions"><button class="btn" id="reload" type="button">刷新</button></div>
       </header>
       <div class="content">

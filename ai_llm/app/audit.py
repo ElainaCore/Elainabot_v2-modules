@@ -1,4 +1,4 @@
-"""Persistent, redacted invocation audit log for the shared LLM service."""
+"""记录并脱敏模型调用日志。"""
 from __future__ import annotations
 
 import copy
@@ -231,7 +231,7 @@ class InvocationAudit:
         self, *, page: int = 1, page_size: int = 20,
         status: str = '', provider: str = '', search: str = '',
     ) -> dict:
-        """Return one filtered summary page without exposing complete log records."""
+        """返回过滤后的日志摘要分页。"""
         values = list(reversed(self._records))
         if status:
             values = [item for item in values if item.get('status') == status]
@@ -257,7 +257,7 @@ class InvocationAudit:
         }
 
     def list(self, *, limit: int = 100, status: str = '', provider: str = '', search: str = '') -> list[dict]:
-        """Compatibility wrapper for callers that still request a bounded list."""
+        """兼容旧版的限量日志列表。"""
         return self.page(
             page=1, page_size=limit, status=status, provider=provider, search=search,
         )['items']

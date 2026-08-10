@@ -25,11 +25,12 @@ if renderer and renderer.playwright_available():
 
 ## PIL 子进程渲染
 
-通过 `renderer.pil` 获取 `PILRenderPool`。
+插件统一使用 Renderer 模块公开的专用协议，不直接获取进程池。
 
 ```python
 from PIL import Image, ImageDraw
 from io import BytesIO
+from modules.renderer.protocol import render_pil
 
 def render_card(title: str):
     image = Image.new("RGB", (800, 240), "white")
@@ -39,12 +40,13 @@ def render_card(title: str):
     image.save(output, format="PNG")
     return output.getvalue(), image.width, image.height
 
-pil = renderer.pil
-if pil:
-    image_bytes, width, height = await pil.render(render_card, "来自插件的卡片")
+image_bytes, width, height = await render_pil(
+    "plugins.example.render:render_card",
+    "来自插件的卡片",
+)
 ```
 
-`await pil.render(fn, *args, **kwargs)` 在独立进程执行同步函数并返回其结果。`fn`、参数和返回值必须可以被 `pickle` 序列化；函数应定义在插件模块顶层，不能使用 lambda、局部函数或闭包。任务默认超时 60 秒，超时或 worker 崩溃会回收并重建进程池。常驻池默认空闲 300 秒后整体退出，下一次渲染时按需重建，以确保 Pillow 未归还的 RSS 最终由进程退出回收。
+`await render_pil(target, *args, **kwargs)` 只发送目标 ID 和数据，不发送 Python callable。`target` 格式为 `plugins.<插件>.<模块>:<模块级函数>`；参数和返回值需可被 `pickle` 序列化。进程池固定使用 `spawn` 干净启动，因此 worker 不会继承主框架及全部已加载插件的内存，也不会额外保留 forkserver 进程。进程按并发需求创建；worker 周期性释放 Python 和 glibc 空闲堆，整池达到任务阈值后在并发归零的间隙重建，空闲超过 `idle_timeout` 后退出。任务超时或 worker 崩溃时会强制回收并重建进程池。
 
 ## Playwright 浏览器渲染
 

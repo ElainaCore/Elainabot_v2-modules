@@ -1,4 +1,4 @@
-"""File and folder based model tools managed by AI LLM."""
+"""管理文件与文件夹形式的模型工具。"""
 from __future__ import annotations
 
 import ast
@@ -39,6 +39,8 @@ class ModelToolStore:
     def __init__(self, data_dir: str):
         self.directory = os.path.abspath(os.path.join(data_dir or '.', 'model_tools'))
         os.makedirs(self.directory, exist_ok=True)
+        self._catalog_cache_key = None
+        self._catalog_cache: list[dict] = []
 
     @staticmethod
     def _metadata(source: str, filename: str) -> dict:
@@ -60,7 +62,16 @@ class ModelToolStore:
             }:
                 raise ModelToolFileError(f'模型工具禁止使用 {node.id}')
             if isinstance(node, ast.Attribute) and node.attr.startswith('__'):
-                raise ModelToolFileError('模型工具禁止访问双下划线属性')
+                safe_type_name = (
+                    node.attr == '__name__'
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == 'type'
+                    and len(node.value.args) == 1
+                    and not node.value.keywords
+                )
+                if not safe_type_name:
+                    raise ModelToolFileError('模型工具禁止访问双下划线属性')
             if (
                 isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
@@ -78,12 +89,12 @@ class ModelToolStore:
         parameters = metadata.get('parameters') or {'type': 'object', 'properties': {}}
         if not isinstance(parameters, dict) or parameters.get('type') != 'object':
             raise ModelToolFileError('parameters 必须是 object JSON Schema')
-        description = str(metadata.get('description') or '').strip()[:500]
+        description = ' '.join(str(metadata.get('description') or '').split())[:120]
         if not description:
             raise ModelToolFileError('模型工具 description 不能为空')
         return {
             'id': tool_id,
-            'name': str(metadata.get('name') or tool_id).strip()[:100],
+            'name': ' '.join(str(metadata.get('name') or tool_id).split())[:100],
             'description': description,
             'parameters': copy.deepcopy(parameters),
             'enabled': bool(metadata.get('enabled', True)),
@@ -93,7 +104,30 @@ class ModelToolStore:
     def _entry(path: str) -> str:
         return os.path.join(path, 'tool.py') if os.path.isdir(path) else path
 
+    def _catalog_signature(self):
+        signature = []
+        try:
+            entries = os.scandir(self.directory)
+        except OSError:
+            return ()
+        with entries:
+            for entry in entries:
+                path = os.path.join(entry.path, 'tool.py') if entry.is_dir(follow_symlinks=False) else entry.path
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                signature.append((entry.name, stat.st_mtime_ns, stat.st_size))
+        return tuple(sorted(signature))
+
+    def _invalidate_catalog(self) -> None:
+        self._catalog_cache_key = None
+        self._catalog_cache = []
+
     def catalog(self) -> list[dict]:
+        signature = self._catalog_signature()
+        if signature == self._catalog_cache_key:
+            return copy.deepcopy(self._catalog_cache)
         result = []
         for name in sorted(os.listdir(self.directory)):
             path = os.path.join(self.directory, name)
@@ -116,7 +150,9 @@ class ModelToolStore:
                 })
             except (ModelToolFileError, OSError, UnicodeDecodeError):
                 continue
-        return result
+        self._catalog_cache_key = signature
+        self._catalog_cache = result
+        return copy.deepcopy(result)
 
     @staticmethod
     def _validate_tree(root: str) -> None:
@@ -179,6 +215,7 @@ class ModelToolStore:
             if os.path.exists(destination) or os.path.exists(destination + '.py'):
                 raise ModelToolFileError(f"模型工具 {metadata['id']} 已存在")
             os.replace(root, destination)
+            self._invalidate_catalog()
             return {
                 **metadata, 'filename': metadata['id'], 'entry': 'tool.py',
                 'kind': 'folder', 'source': 'model_tool',
@@ -202,6 +239,7 @@ class ModelToolStore:
             raise ModelToolFileError(f"模型工具 {metadata['id']} 已存在")
         with open(destination, 'w', encoding='utf-8', newline='\n') as file:
             file.write(source)
+        self._invalidate_catalog()
         return {
             **metadata, 'filename': metadata['id'] + '.py',
             'entry': metadata['id'] + '.py', 'kind': 'file', 'source': 'model_tool',
@@ -217,9 +255,11 @@ class ModelToolStore:
         ):
             if os.path.isfile(path):
                 os.remove(path)
+                self._invalidate_catalog()
                 return True
             if os.path.isdir(path):
                 shutil.rmtree(path)
+                self._invalidate_catalog()
                 return True
         return False
 

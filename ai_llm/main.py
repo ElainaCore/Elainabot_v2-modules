@@ -1,4 +1,4 @@
-"""ElainaBot shared AI service module."""
+"""统一管理大模型服务与扩展能力。"""
 from __future__ import annotations
 
 import asyncio
@@ -19,8 +19,8 @@ from .app.service import DEFAULT_CONFIG, AIService
 
 __module_meta__ = {
     'name': 'AI LLM 服务',
-    'description': '统一管理 LLM、模型工具、插件 Agent、MCP、Skills 与计划任务',
-    'version': '1.2.0',
+    'description': '统一管理模型、工具、Agent、MCP、Skills 和计划任务',
+    'version': '1.2.1',
     'author': 'ElainaBot',
 }
 
@@ -75,6 +75,7 @@ async def setup(ctx):
     register_route('DELETE', f'{PREFIX}/tools', _delete_tool)
     register_route('GET', f'{PREFIX}/tools/market', _tool_market)
     register_route('POST', f'{PREFIX}/tools/install', _install_tool)
+    register_route('GET', f'{PREFIX}/plugin-capabilities', _plugin_capabilities)
     register_route('PUT', f'{PREFIX}/plugin-capabilities', _save_plugin_capabilities)
     register_route('POST', f'{PREFIX}/mcp/refresh', _mcp_refresh)
     register_route('POST', f'{PREFIX}/interrupt', _interrupt)
@@ -90,7 +91,7 @@ async def setup(ctx):
         html_file=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web', 'panel.html'),
     )
     if config.get('auto_fetch_models'):
-        _refresh_task = asyncio.create_task(_refresh_missing_models())
+        _queue_model_refresh()
     log.info('AI LLM 服务已启动')
     return _instance
 
@@ -118,6 +119,7 @@ async def teardown():
         ('DELETE', f'{PREFIX}/tools'),
         ('GET', f'{PREFIX}/tools/market'),
         ('POST', f'{PREFIX}/tools/install'),
+        ('GET', f'{PREFIX}/plugin-capabilities'),
         ('PUT', f'{PREFIX}/plugin-capabilities'),
         ('POST', f'{PREFIX}/mcp/refresh'),
         ('POST', f'{PREFIX}/interrupt'),
@@ -139,7 +141,7 @@ def _service() -> AIService:
 
 
 def get_service() -> AIService | None:
-    """Public plugin API that remains valid under the dynamic module loader."""
+    """返回当前运行中的 AI 服务。"""
     return _instance
 
 
@@ -160,21 +162,25 @@ async def _asset(request: web.Request):
     if not os.path.isfile(path):
         raise web.HTTPNotFound()
     return web.FileResponse(path, headers={
-        'Cache-Control': 'no-store',
+        'Cache-Control': 'no-cache',
         'Content-Type': content_type,
     })
 
 
-async def _get_config(_request):
-    return web.json_response({'success': True, 'data': _service().config(public=True)})
+async def _get_config(request):
+    section = str(request.query.get('section') or '').strip().lower()
+    return web.json_response({
+        'success': True, 'data': _service().config(public=True, section=section),
+    })
 
 
 async def _save_config(request):
     try:
-        data = await _service().save(await _json(request))
-        if data.get('auto_fetch_models'):
-            await _refresh_models()
-            data = _service().config(public=True)
+        body = await _json(request)
+        section = str(request.query.get('section') or '').strip().lower()
+        data = await _service().save(body, section=section)
+        if body.get('auto_fetch_models') and (not _refresh_task or _refresh_task.done()):
+            _queue_model_refresh()
         return web.json_response({'success': True, 'data': data})
     except (TypeError, ValueError) as error:
         return web.json_response({'success': False, 'error': str(error)}, status=400)
@@ -332,12 +338,12 @@ async def _delete_tool(request):
         return web.json_response({'success': False, 'error': str(error)}, status=400)
 
 
-async def _tool_market(_request):
+async def _tool_market(request):
     try:
         installed = {item['id'] for item in _service().model_tool_store.catalog()}
         items = [
             {**item, 'installed': item['id'] in installed}
-            for item in await model_tool_market.catalog()
+            for item in await model_tool_market.catalog(force=request.query.get('refresh') == '1')
         ]
         return web.json_response({'success': True, 'data': items})
     except (ValueError, RuntimeError, OSError, aiohttp.ClientError) as error:
@@ -353,6 +359,17 @@ async def _install_tool(request):
         return web.json_response({'success': True, 'data': item}, status=201)
     except (ValueError, RuntimeError, OSError, aiohttp.ClientError) as error:
         return web.json_response({'success': False, 'error': str(error)}, status=400)
+
+
+async def _plugin_capabilities(request):
+    kind = str(request.query.get('kind') or '').strip().lower()
+    if kind and kind not in {'skill', 'agent', 'mcp', 'tool'}:
+        return web.json_response({'success': False, 'error': '能力类型无效'}, status=400)
+    return web.json_response({
+        'success': True,
+        'data': _service().plugin_capabilities(kind=kind, public=True),
+    })
+
 
 async def _save_plugin_capabilities(request):
     body = await _json(request)
@@ -412,6 +429,12 @@ async def _logs(request):
 async def _clear_logs(_request):
     _service().audit.clear()
     return web.json_response({'success': True, 'data': {'cleared': True}})
+
+
+def _queue_model_refresh() -> None:
+    global _refresh_task
+    if _refresh_task is None or _refresh_task.done():
+        _refresh_task = asyncio.create_task(_refresh_missing_models())
 
 
 async def _refresh_models(force: bool = False) -> dict:

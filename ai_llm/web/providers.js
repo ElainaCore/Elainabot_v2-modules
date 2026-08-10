@@ -56,7 +56,7 @@ async function saveProvider(card, rerender, renderAll) {
   const item = providerFromCard(card);
   const providers = state.providers.map(provider => provider.id === oldId ? item : provider);
   const active = card.querySelector('input[type=radio]').checked ? item.id : state.active_provider;
-  setState(await api('/config', {method: 'PUT', body: JSON.stringify({providers, active_provider: active})}));
+  setState(await api('/config?section=providers', {method: 'PUT', body: JSON.stringify({providers, active_provider: active})}));
   collapsed.delete(oldId);
   if (rerender) renderAll();
   toast(item.name + ' 已保存');
@@ -102,7 +102,7 @@ async function probeModels(card, button, loadAll) {
 
 async function removeProvider(card, renderAll) {
   if (state.providers.length <= 1) throw new Error('至少保留一个接口');
-  setState(await api('/config', {method: 'PUT', body: JSON.stringify({providers: state.providers.filter(item => item.id !== card.dataset.providerId)})}));
+  setState(await api('/config?section=providers', {method: 'PUT', body: JSON.stringify({providers: state.providers.filter(item => item.id !== card.dataset.providerId)})}));
   renderAll(); toast('接口已删除');
 }
 
