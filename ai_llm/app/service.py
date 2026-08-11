@@ -27,6 +27,80 @@ ToolHandler = Callable[[str, dict], Awaitable[dict] | dict]
 CompletionValidator = Callable[[str, list[dict]], str | None]
 
 
+_HIDDEN_REASONING_TAGS = {'analysis', 'reasoning', 'think', 'thinking'}
+_XML_TAG_PATTERN = re.compile(r'<\s*(/?)\s*([a-z][\w:-]*)\b[^>]*>', re.IGNORECASE)
+_TOOL_PROTOCOL_BLOCK = re.compile(
+    r'<\s*(tool_[\w:-]+)\b[^>]*>.*?</\s*\1\s*>',
+    re.IGNORECASE | re.DOTALL,
+)
+_TOOL_PROTOCOL_UNCLOSED = re.compile(
+    r'<\s*tool_[\w:-]+\b[^>]*>.*\Z',
+    re.IGNORECASE | re.DOTALL,
+)
+_TOOL_PROTOCOL_TAG = re.compile(
+    r'</?\s*tool_[\w:-]+\b[^>]*?/?>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+class _HiddenReasoningFilter:
+    """Remove model reasoning tags without leaking split streaming chunks."""
+
+    def __init__(self):
+        self._buffer = ''
+        self._hidden_tag = ''
+
+    def feed(self, value: str) -> str:
+        self._buffer += str(value or '')
+        visible = []
+        while self._buffer:
+            tag_start = self._buffer.find('<')
+            if tag_start < 0:
+                if not self._hidden_tag:
+                    visible.append(self._buffer)
+                self._buffer = ''
+                break
+            if tag_start:
+                if not self._hidden_tag:
+                    visible.append(self._buffer[:tag_start])
+                self._buffer = self._buffer[tag_start:]
+            tag_end = self._buffer.find('>')
+            if tag_end < 0:
+                break
+            token = self._buffer[:tag_end + 1]
+            match = _XML_TAG_PATTERN.fullmatch(token)
+            self._buffer = self._buffer[tag_end + 1:]
+            if match and match.group(2).casefold() in _HIDDEN_REASONING_TAGS:
+                tag = match.group(2).casefold()
+                if match.group(1):
+                    if self._hidden_tag == tag:
+                        self._hidden_tag = ''
+                elif not token.rstrip().endswith('/>'):
+                    self._hidden_tag = tag
+                continue
+            if not self._hidden_tag:
+                visible.append(token)
+        return ''.join(visible)
+
+    def finish(self) -> str:
+        value = self._buffer if not self._hidden_tag else ''
+        self._buffer = ''
+        self._hidden_tag = ''
+        return value
+
+
+def _strip_hidden_reasoning(content: str) -> str:
+    output_filter = _HiddenReasoningFilter()
+    return (output_filter.feed(content) + output_filter.finish()).strip()
+
+
+def _strip_tool_protocol(content: str) -> str:
+    """Remove internal XML tool messages that must never reach end users."""
+    visible = _TOOL_PROTOCOL_BLOCK.sub('', str(content or ''))
+    visible = _TOOL_PROTOCOL_UNCLOSED.sub('', visible)
+    return _TOOL_PROTOCOL_TAG.sub('', visible).strip()
+
+
 class AIServiceError(RuntimeError):
     pass
 
@@ -77,6 +151,15 @@ def _xml_element_value(element: ElementTree.Element):
     return result
 
 
+def _xml_tool_arguments(element: ElementTree.Element) -> dict:
+    """Read both nested XML arguments and common attribute/JSON variants."""
+    arguments = {key: _xml_scalar(value) for key, value in element.attrib.items()}
+    value = _xml_element_value(element)
+    if isinstance(value, dict):
+        arguments.update(value)
+    return arguments
+
+
 def _xml_tool_calls(content: str, tools: list[dict] | None) -> tuple[list[dict], str]:
     """将兼容接口返回的受限 XML 转为工具调用。"""
     if not content or not tools or '<' not in content:
@@ -91,26 +174,24 @@ def _xml_tool_calls(content: str, tools: list[dict] | None) -> tuple[list[dict],
     if not definitions:
         return [], content
 
+    canonical_names = {name.casefold(): name for name in definitions}
+    name_pattern = '|'.join(re.escape(name) for name in definitions)
+    protocol_pattern = re.compile(
+        rf'<(?P<block>{name_pattern})\b[^>]*>(?P<body>.*?)'
+        rf'</\s*(?P=block)\s*>|<(?P<self>{name_pattern})\b[^>]*/>',
+        re.IGNORECASE | re.DOTALL,
+    )
     matches: list[tuple[int, int, str, dict]] = []
-    occupied: list[tuple[int, int]] = []
-    for name in definitions:
-        escaped = re.escape(name)
-        block_pattern = re.compile(
-            rf'<{escaped}\s*>(.*?)</{escaped}\s*>', re.IGNORECASE | re.DOTALL,
-        )
-        for match in block_pattern.finditer(content):
-            try:
-                root = ElementTree.fromstring(match.group(0))
-                value = _xml_element_value(root)
-                arguments = value if isinstance(value, dict) else {}
-            except ElementTree.ParseError:
-                continue
-            matches.append((match.start(), match.end(), name, arguments))
-            occupied.append((match.start(), match.end()))
-        self_pattern = re.compile(rf'<{escaped}\s*/>', re.IGNORECASE)
-        for match in self_pattern.finditer(content):
-            matches.append((match.start(), match.end(), name, {}))
-            occupied.append((match.start(), match.end()))
+    for match in protocol_pattern.finditer(content):
+        name = canonical_names[(match.group('block') or match.group('self')).casefold()]
+        try:
+            arguments = _xml_tool_arguments(ElementTree.fromstring(match.group(0)))
+        except ElementTree.ParseError:
+            body_value = _xml_scalar(match.group('body') or '')
+            arguments = body_value if isinstance(body_value, dict) else {}
+        matches.append((match.start(), match.end(), name, arguments))
+
+    occupied = [(start, end) for start, end, _name, _arguments in matches]
 
     def is_occupied(position: int) -> bool:
         return any(start <= position < end for start, end in occupied)
@@ -353,9 +434,9 @@ DEFAULT_CONFIG = {
             'api_type': 'openai_compatible',
             'base_url': 'https://api.ytea.top/v1',
             'api_key': '',
-            'model': 'gpt-4.1-nano',
-            'models': ['gpt-4.1-nano'],
-            'model_priority': ['gpt-4.1-nano'],
+            'model': '',
+            'models': [],
+            'model_priority': [],
             'disabled_models': [],
             'model_priority_enabled': True,
             'priority': 100,
@@ -1431,7 +1512,7 @@ class AIService:
             payload.pop('stream', None)
             data = await self._request(provider, payload, run_id)
             message = (data.get('choices') or [{}])[0].get('message') or {}
-            content = _message_text(message.get('content'))
+            content = _strip_hidden_reasoning(_message_text(message.get('content')))
             if not content:
                 raise AIProviderError('Gemini 接口返回了空消息')
             yield {
@@ -1488,8 +1569,9 @@ class AIService:
                                 str(part.get('text') or '') for part in content
                                 if isinstance(part, dict)
                             )
+                        content = _strip_hidden_reasoning(str(content or ''))
                         if content:
-                            yield {'type': 'delta', 'text': str(content)}
+                            yield {'type': 'delta', 'text': content}
                         if run_id:
                             self.audit.attempt_finish(
                                 run_id, attempt_id, status='success', http_status=response.status,
@@ -1503,6 +1585,7 @@ class AIService:
                     saw_delta = False
                     response_text = []
                     first_token_ms = None
+                    output_filter = _HiddenReasoningFilter()
                     async for raw_line in response.content:
                         line = raw_line.decode('utf-8', errors='replace').strip()
                         if not line or line.startswith(':'):
@@ -1529,11 +1612,20 @@ class AIService:
                                 if isinstance(part, dict)
                             )
                         if content:
+                            content = output_filter.feed(str(content))
+                        if content:
                             if first_token_ms is None:
                                 first_token_ms = round((time.perf_counter() - request_started) * 1000)
                             saw_delta = True
-                            response_text.append(str(content))
-                            yield {'type': 'delta', 'text': str(content)}
+                            response_text.append(content)
+                            yield {'type': 'delta', 'text': content}
+                    tail = output_filter.finish()
+                    if tail:
+                        if first_token_ms is None:
+                            first_token_ms = round((time.perf_counter() - request_started) * 1000)
+                        saw_delta = True
+                        response_text.append(tail)
+                        yield {'type': 'delta', 'text': tail}
                     if not saw_delta:
                         raise AIProviderError('stream response contained no text')
                     self._health[(provider['id'], model)] = {
@@ -1867,16 +1959,15 @@ class AIService:
             except (KeyError, IndexError, TypeError) as error:
                 raise AIProviderError('接口返回中没有 choices[0].message') from error
             tool_calls = message.get('tool_calls') or []
-            fallback_content = message.get('content')
+            fallback_content = _strip_hidden_reasoning(
+                _message_text(message.get('content'))
+            )
             text_protocol = False
-            if not tool_calls and isinstance(fallback_content, str):
+            if not tool_calls:
                 tool_calls, fallback_content = _xml_tool_calls(fallback_content, tools)
                 text_protocol = bool(tool_calls)
             if not tool_calls:
-                content = message.get('content')
-                if isinstance(content, list):
-                    content = ''.join(str(part.get('text') or '') for part in content if isinstance(part, dict))
-                text = str(content or '').strip()
+                text = _strip_tool_protocol(fallback_content)
                 if not text:
                     raise AIProviderError('接口返回了空消息')
                 validation_error = (
