@@ -185,9 +185,19 @@ async def convert_lifecycle_event(event, id_mapper, self_qq: int) -> dict | None
             return None
         qq_group = await id_mapper.to_qq(event.group_id, 'group')
         qq_user = await id_mapper.to_qq(event.user_id, 'user')
-        verify_info = event.get('d/verify_info') or {}
+        verify_info = getattr(event, 'verify_info', None)
+        if not isinstance(verify_info, dict):
+            verify_info = event.get('d/verify_info') or {}
         comment = verify_info.get('verify_message', '') if isinstance(verify_info, dict) else ''
-        return {
+        if not comment and isinstance(verify_info, dict):
+            qa_list = verify_info.get('review_qa_list')
+            if isinstance(qa_list, list):
+                comment = '\n'.join(
+                    f'问：{item.get("question", "")}\n答：{item.get("answer", "")}'
+                    for item in qa_list
+                    if isinstance(item, dict) and (item.get('question') or item.get('answer'))
+                )
+        result = {
             'time': int(time.time()),
             'self_id': self_qq,
             'post_type': 'request',
@@ -206,6 +216,20 @@ async def convert_lifecycle_event(event, id_mapper, self_qq: int) -> dict | None
             'real_user_id': event.user_id,
             'real_group_id': event.group_id,
         }
+        # 保留 QQ Bot 新版 group.add 申请字段，供 OneBot 扩展消费者使用；
+        # 标准 request_type 仍保持 OneBot 11 的 group，避免破坏既有客户端。
+        for key in ('apply_at', 'apply_source', 'username', 'verify_method'):
+            value = getattr(event, key, '')
+            if value:
+                result[key] = value
+        qa_list = getattr(event, 'review_qa_list', None)
+        if isinstance(qa_list, list):
+            result['review_qa_list'] = [
+                dict(item) for item in qa_list if isinstance(item, dict)
+            ]
+        if isinstance(verify_info, dict):
+            result['verify_info'] = dict(verify_info)
+        return result
 
     entry = _LIFECYCLE_MAP.get(event.event_type)
     if not entry:
