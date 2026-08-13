@@ -6,6 +6,7 @@
   - SendMessageAction: send_msg / send_group_msg / send_private_msg
   - DeleteMessageAction: delete_msg
   - GetLoginInfoAction: get_login_info
+  - GetGroupInfoAction: get_group_info
   - GetGroupListAction: get_group_list
   - GetFriendListAction: get_friend_list
   - GetStrangerInfoAction: get_stranger_info
@@ -23,6 +24,7 @@ from modules.onebot_adapter.actions.can_send_image import CanSendImageAction
 from modules.onebot_adapter.actions.can_send_record import CanSendRecordAction
 from modules.onebot_adapter.actions.delete_msg import DeleteMessageAction
 from modules.onebot_adapter.actions.get_friend_list import GetFriendListAction
+from modules.onebot_adapter.actions.get_group_info import GetGroupInfoAction
 from modules.onebot_adapter.actions.get_group_list import GetGroupListAction
 from modules.onebot_adapter.actions.get_group_member_info import (
     GetGroupMemberInfoAction,
@@ -43,6 +45,7 @@ __all__ = [
     'CanSendRecordAction',
     'DeleteMessageAction',
     'GetFriendListAction',
+    'GetGroupInfoAction',
     'GetGroupListAction',
     'GetGroupMemberInfoAction',
     'GetGroupMemberListAction',

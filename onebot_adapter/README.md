@@ -70,6 +70,7 @@ if ctx:
 | `send_private_msg` | `user_id`、`message` | `data.message_id` |
 | `delete_msg` | `message_id` | 当前实现依赖消息 ID，失败会返回 `retcode=1` |
 | `get_login_info` | 无 | `user_id`、`nickname` |
+| `get_group_info` | `group_id` | 实时群名称、当前成员数和成员上限 |
 | `get_group_list` | 无 | 已缓存群列表 |
 | `get_friend_list` | 无 | 已缓存用户列表 |
 | `get_stranger_info` | `user_id` | 最小用户信息 |
