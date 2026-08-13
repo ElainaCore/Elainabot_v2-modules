@@ -17,7 +17,6 @@ from typing import Any
 
 from core.message._http import MessageType
 from core.message.sender import MessageSender
-from modules.onebot_adapter.payload.segment_parser import ParsedMessage
 from modules.onebot_adapter.payload.payload_converter import PayloadConverter
 from modules.onebot_adapter.payload.segment_parser import ParsedMessage
 
@@ -140,6 +139,7 @@ class MessageSenderService:
             media_data,
             media_type,
             ctn,
+            file_name=parsed.file_name,
             target_group_id=group_id,
             target_user_id=user_id,
             **kwargs,
