@@ -85,7 +85,13 @@ def _segments_to_raw(segments: list[dict]) -> str:
     return ''.join(parts)
 
 
-async def convert_message_event(event, id_mapper, self_qq: int) -> dict | None:
+async def convert_message_event(
+    event,
+    id_mapper,
+    self_qq: int,
+    *,
+    group_name: str = '',
+) -> dict | None:
     """将 Elaina Event 转换为 OneBot 11 message 事件"""
     et = event.event_type
     if et not in (
@@ -157,6 +163,7 @@ async def convert_message_event(event, id_mapper, self_qq: int) -> dict | None:
 
     if is_group:
         ob_event['group_id'] = qq_group
+        ob_event['group_name'] = str(group_name or '')
         ob_event['sender']['card'] = ''
         ob_event['sender']['role'] = event.member_role
         ob_event['anonymous'] = None
