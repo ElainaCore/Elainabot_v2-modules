@@ -19,7 +19,6 @@ from core.message._http import MessageType
 from core.message.sender import MessageSender
 from modules.onebot_adapter.payload.segment_parser import ParsedMessage
 from modules.onebot_adapter.payload.payload_converter import PayloadConverter
-from modules.onebot_adapter.payload.segment_parser import ParsedMessage
 
 
 class MessageSenderService:
