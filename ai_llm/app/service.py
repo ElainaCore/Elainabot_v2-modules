@@ -11,6 +11,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import AsyncIterator, Awaitable, Callable
+from html import unescape
 from urllib.parse import quote
 from xml.etree import ElementTree
 
@@ -29,16 +30,14 @@ CompletionValidator = Callable[[str, list[dict]], str | None]
 
 _HIDDEN_REASONING_TAGS = {'analysis', 'reasoning', 'think', 'thinking'}
 _XML_TAG_PATTERN = re.compile(r'<\s*(/?)\s*([a-z][\w:-]*)\b[^>]*>', re.IGNORECASE)
-_TOOL_PROTOCOL_BLOCK = re.compile(
-    r'<\s*(tool_[\w:-]+)\b[^>]*>.*?</\s*\1\s*>',
-    re.IGNORECASE | re.DOTALL,
+_MARKUP_TAG = re.compile(
+    r'</?[A-Za-z_\u3400-\u9fff][^<>]*>',
+    re.DOTALL,
 )
-_TOOL_PROTOCOL_UNCLOSED = re.compile(
-    r'<\s*tool_[\w:-]+\b[^>]*>.*\Z',
-    re.IGNORECASE | re.DOTALL,
-)
-_TOOL_PROTOCOL_TAG = re.compile(
-    r'</?\s*tool_[\w:-]+\b[^>]*?/?>',
+_TAGGED_SCALAR = re.compile(
+    r'<[A-Za-z_\u3400-\u9fff][^<>]*>\s*'
+    r'(?P<value>[^<>]*?)\s*'
+    r'</[A-Za-z_\u3400-\u9fff][^<>]*>',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -94,11 +93,18 @@ def _strip_hidden_reasoning(content: str) -> str:
     return (output_filter.feed(content) + output_filter.finish()).strip()
 
 
-def _strip_tool_protocol(content: str) -> str:
-    """Remove internal XML tool messages that must never reach end users."""
-    visible = _TOOL_PROTOCOL_BLOCK.sub('', str(content or ''))
-    visible = _TOOL_PROTOCOL_UNCLOSED.sub('', visible)
-    return _TOOL_PROTOCOL_TAG.sub('', visible).strip()
+def _strip_tool_protocol(content: str, *, enabled: bool = True) -> str:
+    """Remove residual angle-bracket protocol from a tool-enabled reply."""
+    text = str(content or '')
+    if not enabled:
+        return text.strip()
+    tags = list(_MARKUP_TAG.finditer(text))
+    if not tags:
+        return text.strip()
+    first, last = tags[0], tags[-1]
+    if len(tags) == 1 and not first.group(0).rstrip().endswith('/>'):
+        return text[:first.start()].strip()
+    return (text[:first.start()] + text[last.end():]).strip()
 
 
 class AIServiceError(RuntimeError):
@@ -160,6 +166,87 @@ def _xml_tool_arguments(element: ElementTree.Element) -> dict:
     return arguments
 
 
+def _protocol_name_key(value: str) -> str:
+    """Normalize harmless model spelling drift such as generateimage."""
+    return re.sub(r'[^a-z0-9]+', '', str(value or '').casefold())
+
+
+def _canonical_protocol_name(value: str, names: dict[str, str]) -> str:
+    exact = names.get(str(value or '').casefold())
+    if exact:
+        return exact
+    key = _protocol_name_key(value)
+    matches = {name for folded, name in names.items() if _protocol_name_key(folded) == key}
+    return matches.pop() if len(matches) == 1 else ''
+
+
+def _canonical_argument_name(value: str, properties: set[str]) -> str:
+    folded = str(value or '').casefold()
+    exact = [name for name in properties if name.casefold() == folded]
+    if exact:
+        return exact[0]
+    key = _protocol_name_key(value)
+    matches = [name for name in properties if _protocol_name_key(name) == key]
+    return matches[0] if len(matches) == 1 else ''
+
+
+def _generic_protocol_call(
+    content: str, definitions: dict[str, dict], canonical_names: dict[str, str],
+) -> tuple[int, int, str, dict] | None:
+    """Parse wrapper-style markup using only registered tool schemas."""
+    scalars = list(_TAGGED_SCALAR.finditer(content))
+    tool_marker = next((
+        (match, name)
+        for match in scalars
+        if (name := _canonical_protocol_name(
+            unescape(match.group('value')).strip(), canonical_names,
+        ))
+    ), None)
+    if tool_marker is None:
+        return None
+
+    marker, name = tool_marker
+    properties = definitions[name]['properties']
+    arguments = {}
+    for key in properties:
+        attribute = re.search(
+            rf'<[^>]*\bname\s*=\s*(["\']){re.escape(key)}\1[^>]*>'
+            rf'(.*?)</[^>]+>',
+            content, re.IGNORECASE | re.DOTALL,
+        )
+        direct = re.search(
+            rf'<\s*{re.escape(key)}\b[^>]*>(.*?)</\s*{re.escape(key)}\s*>',
+            content, re.IGNORECASE | re.DOTALL,
+        )
+        match = attribute or direct
+        if match:
+            arguments[key] = _xml_scalar(
+                unescape(match.group(2 if attribute else 1)).strip()
+            )
+
+    recognized = [
+        (match, key)
+        for match in scalars if match.start() >= marker.end()
+        if (key := _canonical_argument_name(
+            unescape(match.group('value')).strip(), properties,
+        ))
+    ]
+    ignored = {unescape(match.group('value')).strip() for match in scalars}
+    for index, (match, key) in enumerate(recognized):
+        if key in arguments:
+            continue
+        end = recognized[index + 1][0].start() if index + 1 < len(recognized) else len(content)
+        raw = unescape(_MARKUP_TAG.sub('', content[match.end():end]))
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        while lines and lines[0] in ignored:
+            lines.pop(0)
+        if lines:
+            arguments[key] = _xml_scalar('\n'.join(lines))
+
+    tags = list(_MARKUP_TAG.finditer(content))
+    return tags[0].start(), tags[-1].end(), name, arguments
+
+
 def _xml_tool_calls(content: str, tools: list[dict] | None) -> tuple[list[dict], str]:
     """将兼容接口返回的受限 XML 转为工具调用。"""
     if not content or not tools or '<' not in content:
@@ -170,7 +257,11 @@ def _xml_tool_calls(content: str, tools: list[dict] | None) -> tuple[list[dict],
         name = str(function.get('name') or '')
         if name:
             parameters = function.get('parameters') or {}
-            definitions[name] = set(parameters.get('required') or [])
+            properties = parameters.get('properties') or {}
+            definitions[name] = {
+                'required': set(parameters.get('required') or []),
+                'properties': set(properties) | set(parameters.get('required') or []),
+            }
     if not definitions:
         return [], content
 
@@ -192,12 +283,18 @@ def _xml_tool_calls(content: str, tools: list[dict] | None) -> tuple[list[dict],
         matches.append((match.start(), match.end(), name, arguments))
 
     occupied = [(start, end) for start, end, _name, _arguments in matches]
+    generic = _generic_protocol_call(content, definitions, canonical_names)
+    if generic and not any(
+        left < generic[1] and generic[0] < right for left, right in occupied
+    ):
+        matches.append(generic)
+        occupied.append((generic[0], generic[1]))
 
     def is_occupied(position: int) -> bool:
         return any(start <= position < end for start, end in occupied)
 
-    for name, required in definitions.items():
-        if required:
+    for name, definition in definitions.items():
+        if definition['required']:
             continue
         opening_pattern = re.compile(rf'<{re.escape(name)}\s*>', re.IGNORECASE)
         for match in opening_pattern.finditer(content):
@@ -224,6 +321,7 @@ def _xml_tool_calls(content: str, tools: list[dict] | None) -> tuple[list[dict],
 def _text_tool_protocol(tools: list[dict] | None) -> str:
     """生成不支持函数调用时的 XML 工具协议。"""
     definitions = []
+    example = ''
     for item in tools or []:
         function = item.get('function', {}) if isinstance(item, dict) else {}
         name = str(function.get('name') or '').strip()
@@ -236,14 +334,24 @@ def _text_tool_protocol(tools: list[dict] | None) -> str:
             f"{key}{'*' if key in required else ''}" for key in properties
         ) or '无参数'
         definitions.append(f'{name}({arguments})')
+        if not example:
+            if properties:
+                key = next(iter(properties))
+                example = (
+                    f'例如调用 {name} 时输出 '
+                    f'<{name}><{key}>实际参数值</{key}></{name}>。'
+                )
+            else:
+                example = f'例如调用 {name} 时输出 <{name}/>。'
     if not definitions:
         return ''
     return (
         '工具文本兼容协议：优先使用接口原生 tool_calls。若当前模型不能输出原生工具调用，'
-        '则在需要调用工具时只输出 XML，不要同时输出解释文字。格式为 '
-        '<工具名><参数名>参数值</参数名></工具名>；无参数工具使用 <工具名/>。'
-        '对象或数组参数写成 JSON 文本，XML 特殊字符必须转义。一次最多调用 8 个工具。'
-        '只能使用以下工具，星号表示必填参数：' + '；'.join(definitions)
+        '则在需要调用工具时只输出 XML，不要同时输出解释文字。根元素名必须逐字等于'
+        '下列工具名，参数元素名必须逐字等于下列参数名，不要发明包装或占位标签。'
+        + example
+        + '对象或数组参数写成 JSON 文本，XML 特殊字符必须转义。一次最多调用 8 个工具。'
+        + '只能使用以下工具，星号表示必填参数：' + '；'.join(definitions)
     )
 
 
@@ -1967,7 +2075,7 @@ class AIService:
                 tool_calls, fallback_content = _xml_tool_calls(fallback_content, tools)
                 text_protocol = bool(tool_calls)
             if not tool_calls:
-                text = _strip_tool_protocol(fallback_content)
+                text = _strip_tool_protocol(fallback_content, enabled=bool(tools))
                 if not text:
                     raise AIProviderError('接口返回了空消息')
                 validation_error = (

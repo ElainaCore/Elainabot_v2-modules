@@ -20,7 +20,7 @@ from .app.service import DEFAULT_CONFIG, AIService
 __module_meta__ = {
     'name': 'AI LLM 服务',
     'description': '统一管理模型、工具、Agent、MCP、Skills 和计划任务',
-    'version': '1.2.1',
+    'version': '1.2.2',
     'author': 'ElainaBot',
 }
 

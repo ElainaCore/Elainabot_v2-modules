@@ -1,0 +1,7 @@
+{
+  "name": "hello_js",
+  "runtime": "node",
+  "entry": "main.js",
+  "version": "0.1.0",
+  "description": "JavaScript 处理器示例"
+}

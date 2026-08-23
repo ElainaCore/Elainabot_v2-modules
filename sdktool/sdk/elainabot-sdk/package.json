@@ -1,0 +1,7 @@
+{
+  "name": "elainabot-sdk",
+  "version": "0.2.0",
+  "description": "ElainaBot JavaScript 插件 SDK",
+  "main": "index.js",
+  "license": "MIT"
+}
