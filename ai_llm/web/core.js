@@ -4,27 +4,15 @@ export let state = {};
 export let skills = [];
 export let modelTools = [];
 export let modelToolMarket = [];
-const THEME_MAP = {'--bg':'--host-bg','--bg2':'--host-bg2','--bg3':'--host-bg3','--bg-float':'--host-float','--text':'--host-text','--text2':'--host-text2','--text3':'--host-text3','--border':'--host-border','--accent':'--host-accent','--accent-hover':'--host-accent-hover','--accent-light':'--host-accent-light','--accent-soft':'--host-accent-soft','--success':'--host-success','--danger':'--host-danger','--warning':'--host-warning','--info':'--host-info'};
-export function syncHostTheme() {
-  try {
-    if (window.parent === window) return;
-    const parentStyle = window.parent.getComputedStyle(window.parent.document.documentElement);
-    const root = document.documentElement;
-    Object.entries(THEME_MAP).forEach(([source, target]) => {
-      const value = parentStyle.getPropertyValue(source).trim();
-      if (value) root.style.setProperty(target, value);
-    });
-    root.style.colorScheme = parentStyle.colorScheme || 'normal';
-  } catch (_) {}
-}
-syncHostTheme();
 try {
-  if (window.parent !== window) {
-    new MutationObserver(syncHostTheme).observe(window.parent.document.documentElement, {
-      attributes: true,
-      attributeFilter: ['style', 'class'],
-    });
-  }
+  const theme = window.parent !== window && window.parent.ElainaWebPanelTheme;
+  if (theme) theme.bind(document.documentElement, {variables: [], schemeAttributes: ['data-theme'], map: {
+    '--host-bg':'--bg','--host-bg2':'--bg2','--host-bg3':'--bg3','--host-float':'--bg-float',
+    '--host-text':'--text','--host-text2':'--text2','--host-text3':'--text3','--host-border':'--border',
+    '--host-accent':'--accent','--host-accent-hover':'--accent-hover','--host-accent-light':'--accent-light',
+    '--host-accent-soft':'--accent-soft','--host-success':'--success','--host-danger':'--danger',
+    '--host-warning':'--warning','--host-info':'--info'
+  }});
 } catch (_) {}
 function requestUrl(path) { return new URL(path.startsWith('http') ? path : BASE + path, location.origin).toString(); }
 export async function api(path, options = {}) {
