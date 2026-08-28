@@ -83,7 +83,7 @@ if ctx:
 
 ### 消息参数
 
-`message` 支持纯文本和 OneBot 消息段数组。常用段包括 `text`、`image`、`record`、`video`、`file`、`markdown`、`reply`、`at`、`face` 和 `keyboard`。图片、语音、视频、文件段可使用 `file`、`url` 或 `data`，具体可用字段取决于下游发送器和平台权限。
+`message` 支持纯文本和 OneBot 消息段数组。常用段包括 `text`、`image`、`record`、`video`、`file`、`markdown`、`ark`、`reply`、`at`、`face` 和 `keyboard`。图片、语音、视频、文件段可使用 `file`、`url` 或 `data`，具体可用字段取决于下游发送器和平台权限。
 
 ```json
 {
@@ -94,6 +94,24 @@ if ctx:
       {"type": "text", "data": {"text": "今日图片："}},
       {"type": "image", "data": {"file": "https://example.com/a.png"}}
     ]
+  }
+}
+```
+
+Ark 段通过 `args` 和 `kwargs` 传入参数，语义与 core 的 `reply_ark(template_id, kv_data, content='')` 一致。模板 23、24、37 支持相同的简写数据：
+
+```json
+{
+  "action": "send_group_msg",
+  "params": {
+    "group_id": 123456,
+    "message": {
+      "type": "ark",
+      "data": {
+        "args": [23, ["列表卡片标题", "提示文本", [["项目1"], ["项目2", "https://example.com"]]]],
+        "kwargs": {"content": ""}
+      }
+    }
   }
 }
 ```
