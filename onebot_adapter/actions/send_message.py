@@ -5,7 +5,7 @@
   - 通过 IDMapper 将 QQ 号反查为 openid
   - 通过 SegmentParser 解析 OneBot 消息段 → ParsedMessage
   - 通过 MessageSenderService 选择发送策略 (对应 sender.py 的全部 send 模式):
-      text / image / voice / video / file / markdown / buttons / reply
+      text / image / voice / video / file / markdown / ark / buttons / reply
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ class SendMessageAction(BaseAction):
       - 视频 (+文本) → upload_media_bytes(type=2) → MSG_TYPE_MEDIA
       - 文件 (+文本) → upload_media_bytes(type=4) → MSG_TYPE_MEDIA
       - Markdown     → send_to_group/send_to_user (MSG_TYPE_MARKDOWN)
+      - Ark          → send_to_group/send_to_user (MSG_TYPE_ARK)
       - 按钮         → keyboard 参数 → build_keyboard()
       - 回复引用     → message_reference 参数
     """
@@ -117,4 +118,6 @@ class SendMessageAction(BaseAction):
             return f'[文件]{name}'
         if parsed.msg_type == 'markdown':
             return '[Markdown]'
+        if parsed.msg_type == 'ark':
+            return '[Ark]'
         return parsed.text_content[:200] if parsed.text_content else '[空]'
