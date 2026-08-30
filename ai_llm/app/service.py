@@ -807,7 +807,16 @@ class AIService:
             for field in ('enabled', 'content', 'allowed_consumers'):
                 if field in current:
                     incoming[field] = copy.deepcopy(current[field])
-            if current.get('shared_configured'):
+            # Explicit definitions win on first registration. AI dev tools use
+            # this path as a runtime switch; other capabilities retain a user
+            # override once shared_configured has been set.
+            if source == 'ai_dev' and capability_kind == 'tool' and 'shared' in definition:
+                incoming['shared'] = bool(definition.get('shared'))
+                incoming['shared_configured'] = True
+            elif 'shared' in definition and not current.get('shared_configured'):
+                incoming['shared'] = bool(definition.get('shared'))
+                incoming['shared_configured'] = False
+            elif current.get('shared_configured'):
                 incoming['shared'] = bool(current.get('shared'))
                 incoming['shared_configured'] = True
             else:
