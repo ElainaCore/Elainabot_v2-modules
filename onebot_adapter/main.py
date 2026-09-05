@@ -12,11 +12,13 @@
 设计模式:
   - Facade:      OneBotAdapter (adapter.py)
   - Adapter:     HookAdapter (hook_adapter.py)
-  - Command:     BaseAction + 11 子类 (actions/)
+  - Command:     BaseAction + Action 子类 (actions/)
   - Registry:    ActionRegistry (action_registry.py)
   - Builder:     ResponseBuilder (response_builder.py)
   - Strategy:    ImageDecoder / SegmentParser / PayloadConverter / MessageSenderService (payload/)
-  - Observer:    _on_raw_event (adapter.py)
+  - Observer:    OneBotEventDispatcher (event_dispatcher.py)
+  - Runtime:     OneBotNetworkRuntime (network_runtime.py)
+  - Transport:   ws_forward / ws_reverse / ws_protocol (lib/)
   - DI:          ActionContext (action_context.py)
   - VO:          OneBotConfig (config.py)
 

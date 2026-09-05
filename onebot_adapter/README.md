@@ -70,6 +70,7 @@ if ctx:
 | `send_private_msg` | `user_id`、`message` | `data.message_id` |
 | `delete_msg` | `message_id` | 当前实现依赖消息 ID，失败会返回 `retcode=1` |
 | `get_login_info` | 无 | `user_id`、`nickname` |
+| `get_group_msg_history` | `group_id`、可选 `self_id`、`count`、`message_seq` | 本地日志中的群消息，返回 `data.messages`；每条消息包含发送者 `openid` 与 `raw_json` 原始载荷，`message_seq` 为包含锚点的向前翻页游标 |
 | `get_group_list` | 无 | 已缓存群列表 |
 | `get_friend_list` | 无 | 已缓存用户列表 |
 | `get_stranger_info` | `user_id` | 最小用户信息 |
