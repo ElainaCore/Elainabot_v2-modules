@@ -25,6 +25,7 @@
 import contextlib
 import asyncio
 import os
+import sys
 from contextlib import asynccontextmanager
 
 from core.base.logger import EXTENSION, get_logger
@@ -42,6 +43,8 @@ _DEFAULTS = {
     'image_format': 'jpeg',
     'image_quality': 90,
     'browser_type': 'chromium',
+    'auto_install_browser': True,
+    'install_with_deps': False,
     'close_after_use': False,
     'launch_args': [
         '--no-sandbox',
@@ -72,6 +75,8 @@ _COMMENTS = {
     'image_format': '截图格式: jpeg / png',
     'image_quality': '截图质量 (仅 jpeg, 1-100)',
     'browser_type': '浏览器类型: chromium / firefox / webkit',
+    'auto_install_browser': '浏览器缺失时是否自动下载 Playwright 引擎',
+    'install_with_deps': '安装浏览器时是否同时安装系统依赖 (Docker/Linux 需要 root 和 apt)',
     'close_after_use': '用完即关: 每次调用结束后完全关闭浏览器进程, 不保留常驻进程 (适合低内存环境)',
     'launch_args': '浏览器启动参数',
 }
@@ -83,7 +88,13 @@ _COMMENTS = {
 class PlaywrightRenderer(IdleEngine):
     """异步 Playwright 浏览器渲染器 (按需启动, 空闲关闭)"""
 
-    __slots__ = ('_pw', '_browser', '_last_error', '_lifecycle_lock')
+    __slots__ = (
+        '_pw',
+        '_browser',
+        '_last_error',
+        '_lifecycle_lock',
+        '_browser_install_lock',
+    )
 
     def __init__(self, cfg):
         # 用完即关模式只允许一个页面，避免并发启动多个浏览器。
@@ -93,6 +104,8 @@ class PlaywrightRenderer(IdleEngine):
         self._browser = None
         self._last_error = None
         self._lifecycle_lock = asyncio.Lock()
+        # Playwright 安装浏览器是进程级操作；锁可避免并发首次调用重复执行安装。
+        self._browser_install_lock = asyncio.Lock()
 
     async def close(self):
         async with self._lifecycle_lock:
@@ -151,6 +164,8 @@ class PlaywrightRenderer(IdleEngine):
                 self._cfg.get('browser_type', 'chromium'),
                 self._pw.chromium,
             )
+            browser_name = self._cfg.get('browser_type', 'chromium')
+            await self._ensure_browser_binary(launcher, browser_name)
             self._browser = await launcher.launch(
                 headless=self._cfg.get('headless', True),
                 args=self._cfg.get('launch_args', []),
@@ -163,6 +178,50 @@ class PlaywrightRenderer(IdleEngine):
             self._last_error = str(e)
             log.error(f'浏览器启动失败: {e}', exc_info=True)
             return False
+
+    async def _ensure_browser_binary(self, launcher, browser_name):
+        """确保当前环境已安装 Playwright 浏览器引擎。
+
+        Python 包安装不会自动下载浏览器；首次插件实际调用 Playwright 时，
+        这里使用当前运行中的 Python 解释器执行 ``playwright install``。
+        已存在的引擎直接复用，多个并发请求只会触发一次安装。
+        """
+        if not self._cfg.get('auto_install_browser', True):
+            return
+
+        executable = getattr(launcher, 'executable_path', None)
+        if executable and os.path.isfile(executable):
+            return
+
+        async with self._browser_install_lock:
+            # 等待其他协程安装完成后再次检查。
+            executable = getattr(launcher, 'executable_path', None)
+            if executable and os.path.isfile(executable):
+                return
+
+            log.info(f'未检测到 Playwright {browser_name} 浏览器，正在自动安装...')
+            command = [sys.executable, '-m', 'playwright', 'install']
+            if self._cfg.get('install_with_deps', False):
+                command.append('--with-deps')
+            command.append(browser_name)
+            # 保留虚拟环境和 Docker 中自定义的 PLAYWRIGHT_BROWSERS_PATH 等设置。
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                env=os.environ.copy(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            output, _ = await process.communicate()
+            if process.returncode != 0:
+                details = output.decode(errors='replace').strip() if output else ''
+                raise RuntimeError(
+                    f'Playwright {browser_name} 自动安装失败 (退出码 {process.returncode})'
+                    + (f': {details[-1000:]}' if details else '')
+                )
+
+            # executable_path 在不同 Playwright 版本中可能在安装后才解析；
+            # 若仍不存在，让 launch() 报出原生诊断，同时记录安装已完成。
+            log.info(f'✅ Playwright {browser_name} 浏览器安装完成')
 
     async def _release_idle(self):
         """空闲超时关闭浏览器"""

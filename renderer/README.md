@@ -51,6 +51,18 @@ image_bytes, width, height = await render_pil(
 ## Playwright 浏览器渲染
 
 通过 `renderer.playwright` 获取 `PlaywrightRenderer`。首次使用时启动浏览器。
+如果浏览器引擎尚未下载，首次启动会自动使用当前运行时执行
+`python -m playwright install <browser_type>`。因此在 Python 虚拟环境中会安装到该虚拟环境所使用的 Playwright 缓存，
+在 Docker 中会安装到容器环境，不会调用宿主机 Python。
+
+`playwright.yaml` 中可配置：
+
+- `auto_install_browser: true`：缺少浏览器时自动下载（默认开启）。
+- `install_with_deps: false`：Linux/Docker 中可设为 `true`，同时安装系统依赖；需要容器以 root 运行且镜像提供 `apt`，
+  Alpine 等非 Debian 系镜像建议在 Dockerfile 中自行安装依赖，保持此项为 `false`。
+
+Docker 容器通常应保持 `headless: true`，并保留默认的 `--no-sandbox` 启动参数；若使用非 root 用户，确保该用户对
+`PLAYWRIGHT_BROWSERS_PATH`（默认缓存目录）具有写权限。
 
 ### 快捷截图 API
 
