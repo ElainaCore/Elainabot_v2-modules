@@ -59,7 +59,8 @@ image_bytes, width, height = await render_pil(
 
 - `auto_install_browser: true`：缺少浏览器时自动下载（默认开启）。
 - `install_with_deps: false`：Linux/Docker 中可设为 `true`，同时安装系统依赖；需要容器以 root 运行且镜像提供 `apt`，
-  Alpine 等非 Debian 系镜像建议在 Dockerfile 中自行安装依赖，保持此项为 `false`。
+  Alpine 等非 Debian 系镜像建议在 Dockerfile 中自行安装依赖，保持此项为 `false`。浏览器已下载但启动日志提示
+  `error while loading shared libraries` 时，渲染器会自动执行一次 `playwright install --with-deps` 并重试启动。
 
 Docker 容器通常应保持 `headless: true`，并保留默认的 `--no-sandbox` 启动参数；若使用非 root 用户，确保该用户对
 `PLAYWRIGHT_BROWSERS_PATH`（默认缓存目录）具有写权限。

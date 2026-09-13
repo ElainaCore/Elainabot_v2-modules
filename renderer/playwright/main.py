@@ -166,9 +166,8 @@ class PlaywrightRenderer(IdleEngine):
             )
             browser_name = self._cfg.get('browser_type', 'chromium')
             await self._ensure_browser_binary(launcher, browser_name)
-            self._browser = await launcher.launch(
-                headless=self._cfg.get('headless', True),
-                args=self._cfg.get('launch_args', []),
+            self._browser = await self._launch_with_dependency_recovery(
+                launcher, browser_name
             )
             log.info('✅ 浏览器已启动' if not restarting else '✅ 浏览器已重启')
             if not self._cfg.get('close_after_use', False):
@@ -178,6 +177,47 @@ class PlaywrightRenderer(IdleEngine):
             self._last_error = str(e)
             log.error(f'浏览器启动失败: {e}', exc_info=True)
             return False
+
+    async def _launch_with_dependency_recovery(self, launcher, browser_name):
+        """启动浏览器；检测到 Linux 动态库缺失时自动补装依赖后重试一次。"""
+        launch_kwargs = {
+            'headless': self._cfg.get('headless', True),
+            'args': self._cfg.get('launch_args', []),
+        }
+        try:
+            return await launcher.launch(**launch_kwargs)
+        except Exception as first_error:
+            if not self._cfg.get('auto_install_browser', True):
+                raise
+            message = str(first_error)
+            missing_library = (
+                'error while loading shared libraries:' in message
+                or 'cannot open shared object file' in message
+            )
+            if not missing_library:
+                raise
+            log.warning(
+                'Chromium 已安装但缺少系统动态库，尝试执行 playwright install --with-deps'
+            )
+            await self._install_browser_dependencies(browser_name)
+            return await launcher.launch(**launch_kwargs)
+
+    async def _install_browser_dependencies(self, browser_name):
+        """安装 Playwright 浏览器及系统依赖；失败时保留命令输出。"""
+        command = [sys.executable, '-m', 'playwright', 'install', '--with-deps', browser_name]
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            env=os.environ.copy(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        output, _ = await process.communicate()
+        if process.returncode != 0:
+            details = output.decode(errors='replace').strip() if output else ''
+            raise RuntimeError(
+                f'Playwright {browser_name} 系统依赖安装失败 (退出码 {process.returncode})'
+                + (f': {details[-1000:]}' if details else '')
+            )
 
     async def _ensure_browser_binary(self, launcher, browser_name):
         """确保当前环境已安装 Playwright 浏览器引擎。
