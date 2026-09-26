@@ -83,6 +83,17 @@ async def _create_pool(connect_concurrency, minsize, maxsize, pool_recycle, **co
                 wakeup.add_done_callback(lambda task: None if task.cancelled() else task.exception())
             return result
 
+        def _adopt(self, task):
+            """被取消的 acquire 已发起的建连: 连接建成后归还池中 (不泄漏半开连接)"""
+            if task.cancelled() or task.exception() is not None:
+                return
+            conn = task.result()
+            if self._closing or _conn_broken(conn):
+                conn.close()
+                return
+            self._used.add(conn)
+            self.release(conn)
+
         async def _acquire(self):
             if self._closing:
                 raise RuntimeError('Cannot acquire connection after closing pool')
@@ -106,7 +117,15 @@ async def _create_pool(connect_concurrency, minsize, maxsize, pool_recycle, **co
                     break
             try:
                 async with self._connect_sem:
-                    conn = await aiomysql.connect(echo=self._echo, loop=self._loop, **self._conn_kwargs)
+                    connect_task = asyncio.ensure_future(
+                        aiomysql.connect(echo=self._echo, loop=self._loop, **self._conn_kwargs)
+                    )
+                    try:
+                        conn = await asyncio.shield(connect_task)
+                    except asyncio.CancelledError:
+                        # 取消时建连已发起: 连接建成后归还池中, 不泄漏半开连接
+                        connect_task.add_done_callback(self._adopt)
+                        raise
             except BaseException:
                 async with self._cond:
                     if registered:
@@ -139,12 +158,15 @@ class _AcquireContext:
         self._conn = None
 
     async def __aenter__(self):
-        # 用 shield 让 acquire 继续完成, 超时或取消后将连接归还池中。
         acquire_task = asyncio.ensure_future(self._pool.acquire())
         try:
             self._conn = await asyncio.wait_for(asyncio.shield(acquire_task), self._timeout)
         except BaseException as exc:
+            # 超时/被取消 (如调度器 300s 看门狗): 真正取消底层 acquire, 死请求不留队,
+            # 否则拥塞时残留请求占着建连名额/排队位, 连接池无法自愈;
+            # 已发起建连的由 _Pool._adopt 兜底归还, 不泄漏半开连接。
             acquire_task.add_done_callback(self._release_late)
+            acquire_task.cancel()
             if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
                 pool = self._pool
                 maxsize_info = f' maxsize={pool._maxsize}' if pool._maxsize else ''
