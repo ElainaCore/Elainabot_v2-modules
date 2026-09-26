@@ -17,6 +17,7 @@ _DEFAULTS = {
     'database': '',
     'charset': 'utf8mb4',
     'minsize': 2,
+    'maxsize': 150,
     'connect_timeout': 10,
     'acquire_timeout': 10,
     'pool_recycle': 300,
@@ -33,6 +34,7 @@ _COMMENTS = {
     'database': '数据库名称 (必填)',
     'charset': '字符集编码',
     'minsize': '连接池最小连接数',
+    'maxsize': '连接池最大连接数, 达到上限后新请求排队等待空闲连接, 防止洪峰时无限膨胀拖垮 MySQL (0 为不限制)',
     'connect_timeout': '连接超时 (秒)',
     'acquire_timeout': '获取连接超时 (秒), 建连或等待连接时快速报错',
     'pool_recycle': '空闲连接最长保留时间 (秒), 避免长时间占用 MySQL 服务端连接数',
@@ -52,9 +54,13 @@ async def _safe_rollback(conn):
         await conn.rollback()
 
 
-async def _create_pool(connect_concurrency, minsize, pool_recycle, **conn_kwargs):
-    """创建无限连接池, 锁内取空闲连接, 锁外限流建连"""
+async def _create_pool(connect_concurrency, minsize, maxsize, pool_recycle, **conn_kwargs):
+    """创建带上限的连接池, 锁内取空闲连接, 超限排队等释放, 锁外限流建连"""
     import aiomysql
+
+    # 防呆: maxsize 小于 minsize 时按 minsize 处理, 否则启动预热后池永远满载
+    if 0 < maxsize < minsize:
+        maxsize = minsize
 
     class _Pool(aiomysql.Pool):
         def _pop_reusable_free(self):
@@ -80,18 +86,31 @@ async def _create_pool(connect_concurrency, minsize, pool_recycle, **conn_kwargs
         async def _acquire(self):
             if self._closing:
                 raise RuntimeError('Cannot acquire connection after closing pool')
+            registered = False
             async with self._cond:
-                conn = self._pop_reusable_free()
-                if conn is not None:
-                    self._used.add(conn)
-                    return conn
-                self._acquiring += 1  # 锁内占名额, 锁外建连
+                while True:
+                    conn = self._pop_reusable_free()
+                    if conn is not None:
+                        self._used.add(conn)
+                        return conn
+                    if self._closing:
+                        # 把唤醒机会让给下一个等待者 (如 wait_closed), 避免唤醒链断掉挂死
+                        self._cond.notify()
+                        raise RuntimeError('Cannot acquire connection after closing pool')
+                    if self._maxsize and len(self._used) + self._acquiring >= self._maxsize:
+                        # 已达上限, 不再登记新建, 排队等待连接释放 (release 会 notify)
+                        await self._cond.wait()
+                        continue
+                    self._acquiring += 1  # 锁内占名额, 锁外建连
+                    registered = True
+                    break
             try:
                 async with self._connect_sem:
                     conn = await aiomysql.connect(echo=self._echo, loop=self._loop, **self._conn_kwargs)
             except BaseException:
                 async with self._cond:
-                    self._acquiring -= 1
+                    if registered:
+                        self._acquiring -= 1
                     self._cond.notify()
                 raise
             async with self._cond:
@@ -101,6 +120,7 @@ async def _create_pool(connect_concurrency, minsize, pool_recycle, **conn_kwargs
 
     pool = _Pool(minsize, 0, False, pool_recycle, asyncio.get_running_loop(), **conn_kwargs)
     pool._connect_sem = asyncio.Semaphore(max(1, connect_concurrency))
+    pool._maxsize = max(0, int(maxsize))
     if minsize > 0:
         async with pool._cond:
             await pool._fill_free_pool(False)
@@ -127,9 +147,11 @@ class _AcquireContext:
             acquire_task.add_done_callback(self._release_late)
             if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
                 pool = self._pool
+                maxsize_info = f' maxsize={pool._maxsize}' if pool._maxsize else ''
                 self._log.error(
                     f'获取 MySQL 连接超时 ({self._timeout}s), 连接池占用: '
                     f'used={len(pool._used)} free={pool.freesize} connecting={pool._acquiring}'
+                    f'{maxsize_info}'
                 )
                 raise RuntimeError(f'MySQL 连接池获取超时 ({self._timeout}s)') from None
             raise
@@ -174,6 +196,7 @@ class MySQLPool:
             self._pool = await _create_pool(
                 connect_concurrency=int(self._cfg.get('connect_concurrency', 8)),
                 minsize=int(self._cfg.get('minsize', 2)),
+                maxsize=int(self._cfg.get('maxsize', 150)),
                 pool_recycle=int(self._cfg.get('pool_recycle', 300)),
                 host=self._cfg.get('host', '127.0.0.1'),
                 port=int(self._cfg.get('port', 3306)),
@@ -351,7 +374,7 @@ class MySQLPool:
 _holder = {'sig': None, 'pool': None, 'pending_close': None}
 
 _SIG_KEYS = (
-    'host', 'port', 'user', 'password', 'database', 'charset', 'minsize',
+    'host', 'port', 'user', 'password', 'database', 'charset', 'minsize', 'maxsize',
     'connect_timeout', 'acquire_timeout', 'pool_recycle', 'connect_concurrency', 'autocommit',
 )
 
