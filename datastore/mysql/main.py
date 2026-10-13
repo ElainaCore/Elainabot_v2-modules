@@ -55,16 +55,13 @@ async def _safe_rollback(conn):
 
 
 async def _create_pool(connect_concurrency, minsize, maxsize, pool_recycle, **conn_kwargs):
-    """创建带上限的连接池, 锁内取空闲连接, 超限排队等释放, 锁外限流建连"""
+    """复用归还连接，并把建连中的占位保留到握手真正结束。"""
     import aiomysql
-
-    # 防呆: maxsize 小于 minsize 时按 minsize 处理, 否则启动预热后池永远满载
     if 0 < maxsize < minsize:
         maxsize = minsize
 
     class _Pool(aiomysql.Pool):
         def _pop_reusable_free(self):
-            """锁内调用: 剔除失效/超期空闲连接, 返回一个可复用连接或 None"""
             while self._free:
                 conn = self._free.popleft()
                 expired = self._recycle > -1 and self._loop.time() - conn.last_usage > self._recycle
@@ -74,8 +71,11 @@ async def _create_pool(connect_concurrency, minsize, maxsize, pool_recycle, **co
                     return conn
             return None
 
+        async def _wakeup(self):
+            async with self._cond:
+                self._cond.notify_all()
+
         def release(self, conn):
-            """父类丢弃连接时不唤醒, 会让 wait_closed 挂住, 这里补一次。"""
             discarded = conn in self._used and (conn.closed or conn.get_transaction_status())
             result = super().release(conn)
             if discarded:
@@ -83,63 +83,86 @@ async def _create_pool(connect_concurrency, minsize, maxsize, pool_recycle, **co
                 wakeup.add_done_callback(lambda task: None if task.cancelled() else task.exception())
             return result
 
-        def _adopt(self, task):
-            """被取消的 acquire 已发起的建连: 连接建成后归还池中 (不泄漏半开连接)"""
-            if task.cancelled() or task.exception() is not None:
-                return
-            conn = task.result()
-            if self._closing or _conn_broken(conn):
-                conn.close()
-                return
-            self._used.add(conn)
-            self.release(conn)
+        def close(self):
+            super().close()
+            wakeup = self._loop.create_task(self._wakeup())
+            wakeup.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+
+        async def _adopt(self, task):
+            conn = None
+            if not task.cancelled() and task.exception() is None:
+                conn = task.result()
+            async with self._cond:
+                self._acquiring -= 1
+                if conn is not None:
+                    if self._closing or _conn_broken(conn):
+                        conn.close()
+                    else:
+                        self._free.append(conn)
+                self._cond.notify_all()
+
+        def _adopt_late(self, task):
+            adoption = self._loop.create_task(self._adopt(task))
+            self._adoptions.add(adoption)
+            def done(finished):
+                self._adoptions.discard(finished)
+                if not finished.cancelled():
+                    finished.exception()
+            adoption.add_done_callback(done)
 
         async def _acquire(self):
-            if self._closing:
-                raise RuntimeError('Cannot acquire connection after closing pool')
-            registered = False
             async with self._cond:
                 while True:
+                    if self._closing:
+                        self._cond.notify_all()
+                        raise RuntimeError('Cannot acquire connection after closing pool')
                     conn = self._pop_reusable_free()
                     if conn is not None:
                         self._used.add(conn)
                         return conn
-                    if self._closing:
-                        # 把唤醒机会让给下一个等待者 (如 wait_closed), 避免唤醒链断掉挂死
-                        self._cond.notify()
-                        raise RuntimeError('Cannot acquire connection after closing pool')
-                    if self._maxsize and len(self._used) + self._acquiring >= self._maxsize:
-                        # 已达上限, 不再登记新建, 排队等待连接释放 (release 会 notify)
-                        await self._cond.wait()
-                        continue
-                    self._acquiring += 1  # 锁内占名额, 锁外建连
-                    registered = True
-                    break
+                    has_capacity = not self._maxsize or self.size < self._maxsize
+                    if has_capacity and self._acquiring < self._connect_limit:
+                        self._acquiring += 1
+                        break
+                    await self._cond.wait()
             try:
-                async with self._connect_sem:
-                    connect_task = asyncio.ensure_future(
-                        aiomysql.connect(echo=self._echo, loop=self._loop, **self._conn_kwargs)
-                    )
-                    try:
-                        conn = await asyncio.shield(connect_task)
-                    except asyncio.CancelledError:
-                        # 取消时建连已发起: 连接建成后归还池中, 不泄漏半开连接
-                        connect_task.add_done_callback(self._adopt)
-                        raise
+                connect_task = asyncio.ensure_future(
+                    aiomysql.connect(echo=self._echo, loop=self._loop, **self._conn_kwargs)
+                )
             except BaseException:
                 async with self._cond:
-                    if registered:
-                        self._acquiring -= 1
-                    self._cond.notify()
+                    self._acquiring -= 1
+                    self._cond.notify_all()
                 raise
-            async with self._cond:
+            try:
+                conn = await asyncio.shield(connect_task)
+            except asyncio.CancelledError:
+                connect_task.add_done_callback(self._adopt_late)
+                raise
+            except BaseException:
+                # 握手已经结束；清理交给独立任务，避免取条件锁时被取消留下占位。
+                connect_task.add_done_callback(self._adopt_late)
+                raise
+            try:
+                await self._cond.acquire()
+            except BaseException:
+                connect_task.add_done_callback(self._adopt_late)
+                raise
+            try:
                 self._acquiring -= 1
+                if self._closing:
+                    conn.close()
+                    raise RuntimeError('Cannot acquire connection after closing pool')
                 self._used.add(conn)
                 return conn
+            finally:
+                self._cond.notify_all()
+                self._cond.release()
 
-    pool = _Pool(minsize, 0, False, pool_recycle, asyncio.get_running_loop(), **conn_kwargs)
-    pool._connect_sem = asyncio.Semaphore(max(1, connect_concurrency))
+    pool = _Pool(minsize, maxsize, False, pool_recycle, asyncio.get_running_loop(), **conn_kwargs)
+    pool._connect_limit = max(1, int(connect_concurrency))
     pool._maxsize = max(0, int(maxsize))
+    pool._adoptions = set()
     if minsize > 0:
         async with pool._cond:
             await pool._fill_free_pool(False)
@@ -216,17 +239,17 @@ class MySQLPool:
             return
         try:
             self._pool = await _create_pool(
-                connect_concurrency=int(self._cfg.get('connect_concurrency', 8)),
-                minsize=int(self._cfg.get('minsize', 2)),
-                maxsize=int(self._cfg.get('maxsize', 150)),
-                pool_recycle=int(self._cfg.get('pool_recycle', 300)),
+                connect_concurrency=int(self._cfg.get('connect_concurrency', _DEFAULTS['connect_concurrency'])),
+                minsize=int(self._cfg.get('minsize', _DEFAULTS['minsize'])),
+                maxsize=int(self._cfg.get('maxsize', _DEFAULTS['maxsize'])),
+                pool_recycle=int(self._cfg.get('pool_recycle', _DEFAULTS['pool_recycle'])),
                 host=self._cfg.get('host', '127.0.0.1'),
                 port=int(self._cfg.get('port', 3306)),
                 user=self._cfg.get('user', 'root'),
                 password=str(self._cfg.get('password', '')),
                 db=self._cfg.get('database'),
                 charset=self._cfg.get('charset', 'utf8mb4'),
-                connect_timeout=int(self._cfg.get('connect_timeout', 10)),
+                connect_timeout=int(self._cfg.get('connect_timeout', _DEFAULTS['connect_timeout'])),
                 autocommit=bool(self._cfg.get('autocommit', True)),
             )
             self._available = True
@@ -250,7 +273,7 @@ class MySQLPool:
         """获取连接 (用作 async with pool.acquire() as conn), 带超时快速失败"""
         if not self.is_available():
             raise RuntimeError('MySQL 连接池不可用')
-        return _AcquireContext(self._pool, int(self._cfg.get('acquire_timeout', 10)), self._log)
+        return _AcquireContext(self._pool, int(self._cfg.get('acquire_timeout', _DEFAULTS['acquire_timeout'])), self._log)
 
     # ---------- 便捷方法 ----------
 
@@ -379,6 +402,23 @@ class MySQLPool:
                 self._log.error(f'MySQL 事务执行失败: {exc}')
                 return False
 
+    async def transaction(self, callback):
+        """在同一连接上执行异步回调并提交事务。回调异常会回滚。
+
+        回调只应使用传入连接，不能再调用本连接池的便捷方法。
+        """
+        if not self.is_available():
+            raise RuntimeError('MySQL 连接池不可用')
+        async with self.acquire() as conn:
+            try:
+                await conn.begin()
+                result = await callback(conn)
+                await conn.commit()
+                return result
+            except BaseException:
+                await _safe_rollback(conn)
+                raise
+
     async def ping(self):
         """连通性测试"""
         try:
@@ -397,7 +437,8 @@ _holder = {'sig': None, 'pool': None, 'pending_close': None}
 
 _SIG_KEYS = (
     'host', 'port', 'user', 'password', 'database', 'charset', 'minsize', 'maxsize',
-    'connect_timeout', 'acquire_timeout', 'pool_recycle', 'connect_concurrency', 'autocommit',
+    'connect_timeout', 'acquire_timeout', 'pool_recycle', 'connect_concurrency',
+    'autocommit',
 )
 
 
