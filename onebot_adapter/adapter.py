@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 
 from modules.onebot_adapter.action_context import ActionContext
@@ -58,6 +60,9 @@ class OneBotAdapter:
       - 事件格式转换 → lib/event_converter.py
     """
 
+    _GROUP_NAME_CACHE_TTL = 300
+    _EMPTY_GROUP_NAME_CACHE_TTL = 3600
+
     # --- instance variables (declared for type checker) ---
     _mctx: ModuleContext
     log: Any
@@ -87,6 +92,8 @@ class OneBotAdapter:
 
         # 运行时状态
         self._bm: BotManager | None = None  # BotManager 引用
+        self._group_name_cache: dict[tuple[str, str], tuple[float, str]] = {}
+        self._group_name_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     # ==================== 生命周期 ====================
 
@@ -348,6 +355,49 @@ class OneBotAdapter:
 
     # ==================== 事件处理 (Observer) ====================
 
+    async def _get_cached_group_name(self, event: Event, bot: Any) -> str:
+        """优先读取已保存的群名，未命中时查询一次群资料。"""
+        group_id = str(event.group_id or '')
+        if not event.is_group or not group_id:
+            return ''
+
+        cache_key = (str(event.appid or ''), group_id)
+        now = time.monotonic()
+        cached = self._group_name_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        lock = self._group_name_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()
+            cached = self._group_name_cache.get(cache_key)
+            if cached and cached[0] > now:
+                return cached[1]
+
+            group_name = ''
+            sender = getattr(bot, 'sender', None)
+            get_group_record = getattr(sender, 'get_group_record', None)
+            if get_group_record is not None:
+                try:
+                    record = await get_group_record(group_id)
+                    if isinstance(record, dict):
+                        group_name = str(record.get('group_name') or '')
+                except Exception as e:
+                    self.log.debug(f'读取 OneBot 上报群名失败: group_id={group_id}, error={e}')
+
+            get_group_info = getattr(sender, 'get_group_info', None)
+            if not group_name and get_group_info is not None:
+                try:
+                    group_info = await get_group_info(group_id)
+                    if isinstance(group_info, dict):
+                        group_name = str(group_info.get('group_name') or '')
+                except Exception as e:
+                    self.log.debug(f'刷新 OneBot 上报群名失败: group_id={group_id}, error={e}')
+
+            ttl = self._GROUP_NAME_CACHE_TTL if group_name else self._EMPTY_GROUP_NAME_CACHE_TTL
+            self._group_name_cache[cache_key] = (now + ttl, group_name)
+            return group_name
+
     async def _on_raw_event(self, event: Event, bot: Any) -> None:
         """on_raw_event 回调 — 将事件转为 OneBot 格式推送到 WS 客户端
 
@@ -391,7 +441,13 @@ class OneBotAdapter:
         if event.is_lifecycle:
             ob_event = await convert_lifecycle_event(event, self.id_mapper, self_qq)
         else:
-            ob_event = await convert_message_event(event, self.id_mapper, self_qq)
+            group_name = await self._get_cached_group_name(event, bot)
+            ob_event = await convert_message_event(
+                event,
+                self.id_mapper,
+                self_qq,
+                group_name=group_name,
+            )
 
         if ob_event:
             if has_ws:
