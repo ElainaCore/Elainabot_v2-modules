@@ -1,6 +1,6 @@
 """消息段解析 — Strategy 模式
 
-将 OneBot 11 消息段 (text/at/image/record/video/file/markdown/reply/keyboard) 解析为 ParsedMessage。
+将 OneBot 11 消息段 (text/at/image/record/video/file/markdown/ark/reply/keyboard) 解析为 ParsedMessage。
 """
 
 from __future__ import annotations
@@ -23,8 +23,10 @@ class ParsedMessage:
     file_name: str | None = None  # 文件名
     buttons: list | None = None  # 键盘按钮 [{label, ...}, ...]
     message_reference: dict | None = None  # 消息引用 (reply)
-    msg_type: str = 'text'  # text | markdown | record | video | file
+    msg_type: str = 'text'  # text | markdown | ark | record | video | file
     markdown_content: str = ''  # markdown 源码 (msg_type=markdown 时)
+    ark_args: list[Any] | None = None  # reply_ark 的位置参数
+    ark_kwargs: dict[str, Any] | None = None  # reply_ark 的关键字参数
     error: str | None = None
 
     @property
@@ -128,6 +130,26 @@ class SegmentParser:
         pm.markdown_content = seg_data.get('content', '') or seg_data.get('data', '')
 
     @classmethod
+    def _parse_ark(cls, seg_data: dict, pm: ParsedMessage) -> None:
+        """Ark 卡片消息段，参数语义与 core 的 reply_ark 一致。"""
+        pm.msg_type = 'ark'
+        if not isinstance(seg_data, dict):
+            pm.error = 'ark data 必须为对象'
+            return
+
+        args = seg_data.get('args', [])
+        kwargs = seg_data.get('kwargs', {})
+        if not isinstance(args, list | tuple):
+            pm.error = 'ark data.args 必须为数组'
+            return
+        if not isinstance(kwargs, dict):
+            pm.error = 'ark data.kwargs 必须为对象'
+            return
+
+        pm.ark_args = list(args)
+        pm.ark_kwargs = dict(kwargs)
+
+    @classmethod
     def _parse_reply(cls, seg_data: dict, pm: ParsedMessage) -> None:
         """回复 (引用) 消息段"""
         mid = seg_data.get('message_id') or seg_data.get('id')
@@ -172,6 +194,7 @@ class SegmentParser:
         'video': _parse_video.__func__,
         'file': _parse_file.__func__,
         'markdown': _parse_markdown.__func__,
+        'ark': _parse_ark.__func__,
         'reply': _parse_reply.__func__,
         'keyboard': _parse_keyboard.__func__,
         'button': _parse_keyboard.__func__,  # 别名
