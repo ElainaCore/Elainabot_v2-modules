@@ -10,7 +10,7 @@ let activePage = 'overview';
 const loadedPages = new Set();
 const pageRequests = new Map();
 const pageEpoch = new Map();
-const sidebarMedia = window.matchMedia('(max-width: 600px)');
+const sidebarMedia = window.matchMedia('(max-width: 760px)');
 const sidebarStorageKey = 'ai-sidebar-collapsed';
 
 function setSidebarCollapsed(collapsed, persist = true) {
@@ -131,7 +131,7 @@ function showPage(page) {
   document.querySelectorAll('.nav button').forEach(button => button.classList.toggle('active', button.dataset.page === activePage));
   document.querySelectorAll('.page').forEach(section => section.classList.toggle('active', section.id === 'page-' + activePage));
   const active = document.querySelector('.nav button.active');
-  $('page-title').textContent = active ? active.textContent.trim() : activePage;
+  $('page-title').textContent = active ? active.querySelector('span').textContent.trim() : activePage;
   renderPage(activePage);
   if (sidebarMedia.matches) setSidebarCollapsed(true, false);
   loadPage(activePage).catch(error => toast(error.message, true));
@@ -153,9 +153,9 @@ document.addEventListener('keydown', event => {
 });
 sidebarMedia.addEventListener('change', event => {
   if (event.matches) setSidebarCollapsed(true, false);
-  else setSidebarCollapsed(localStorage.getItem(sidebarStorageKey) !== '0', false);
+  else setSidebarCollapsed(localStorage.getItem(sidebarStorageKey) === '1', false);
 });
-setSidebarCollapsed(sidebarMedia.matches || localStorage.getItem(sidebarStorageKey) !== '0', false);
+setSidebarCollapsed(sidebarMedia.matches || localStorage.getItem(sidebarStorageKey) === '1', false);
 $('reload').onclick = () => loadPage(activePage, true).then(() => {
   toast('已刷新');
 }).catch(error => toast(error.message, true));
