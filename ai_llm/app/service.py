@@ -368,7 +368,7 @@ def _tools_parameter_unsupported(error_text: str) -> bool:
 
 
 PROVIDER_TYPES = {
-    'openai', 'openai_compatible', 'gemini', 'gemini_openai', 'grok',
+    'openai', 'openai_compatible', 'openai_responses', 'gemini', 'gemini_openai', 'grok',
     'agnes', 'novelai', 'jimeng2api', 'z_image_gitee',
 }
 _PROVIDER_PATH_DEFAULTS = {
@@ -384,6 +384,11 @@ def _provider_endpoint(provider: dict, key: str, *, model: str = '') -> str:
     if provider.get('api_type') == 'gemini' and key == 'chat_path':
         return f"{base}/models/{quote(model, safe='')}:generateContent"
     path = str(provider.get(key) or _PROVIDER_PATH_DEFAULTS[key]).strip()
+    if provider.get('api_type') == 'openai_responses' and key == 'chat_path' and path == '/chat/completions':
+        path = '/responses'
+    for suffix in ('/chat/completions', '/responses'):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
     return base + '/' + path.lstrip('/')
 
 
@@ -404,9 +409,61 @@ def _message_text(content) -> str:
     if isinstance(content, list):
         return ''.join(
             str(item.get('text') or '') for item in content
-            if isinstance(item, dict) and item.get('type') in {'text', 'input_text'}
+            if isinstance(item, dict) and item.get('type') in {'text', 'input_text', 'output_text'}
         )
     return str(content or '')
+
+
+def _adapt_chat_payload(provider: dict, payload: dict) -> dict:
+    result = copy.deepcopy(payload)
+    model = str(result.get('model') or '').lower().split('/')[-1]
+    if provider.get('api_type') == 'openai' or model.startswith(('o1', 'o3', 'o4', 'gpt-5', 'gpt-6')):
+        if 'max_tokens' in result:
+            result['max_completion_tokens'] = result.pop('max_tokens')
+    if model.startswith(('o1', 'o3', 'o4', 'gpt-5', 'gpt-6')):
+        result.pop('temperature', None)
+    return result
+
+
+def _responses_payload(payload: dict) -> dict:
+    items = []
+    for message in payload.get('messages', []):
+        if message.get('role') == 'tool':
+            items.append({'type': 'function_call_output', 'call_id': message['tool_call_id'], 'output': _message_text(message.get('content'))})
+            continue
+        if message.get('content'):
+            content = message['content']
+            if isinstance(content, list):
+                content = [
+                    {'type': 'input_image', 'image_url': part['image_url']['url']} if part.get('type') == 'image_url'
+                    else {'type': 'output_text' if message['role'] == 'assistant' else 'input_text', 'text': part.get('text', '')}
+                    for part in content
+                ]
+            items.append({'role': message['role'], 'content': content})
+        for call in message.get('tool_calls') or []:
+            items.append({'type': 'function_call', 'call_id': call['id'], **call['function']})
+    result = {'model': payload['model'], 'input': items, 'store': False,
+              'max_output_tokens': payload.get('max_completion_tokens', payload.get('max_tokens'))}
+    if 'temperature' in payload:
+        result['temperature'] = payload['temperature']
+    if payload.get('tools'):
+        result['tools'] = [{'type': 'function', **tool['function']} for tool in payload['tools']]
+        result['tool_choice'] = payload.get('tool_choice', 'auto')
+    return result
+
+
+def _responses_to_chat(data: dict) -> dict:
+    text, calls = [], []
+    for item in data.get('output') or []:
+        if item.get('type') == 'message':
+            text.append(_message_text(item.get('content')))
+        elif item.get('type') == 'function_call':
+            calls.append({'id': item['call_id'], 'type': 'function', 'function': {
+                'name': item['name'], 'arguments': item.get('arguments', '{}')}})
+    usage = data.get('usage') or {}
+    return {'choices': [{'message': {'role': 'assistant', 'content': ''.join(text), 'tool_calls': calls},
+                         'finish_reason': 'length' if data.get('status') == 'incomplete' else 'stop'}],
+            'usage': {**usage, 'prompt_tokens': usage.get('input_tokens', 0), 'completion_tokens': usage.get('output_tokens', 0)}}
 
 
 def _openai_to_gemini(payload: dict) -> dict:
@@ -1504,20 +1561,29 @@ class AIService:
             started = time.perf_counter()
             try:
                 async with semaphore:
-                    result = await self._complete_candidate(
-                        provider, model, [{'role': 'user', 'content': '你好'}], '',
-                        0, 32, None, None, 0,
-                    )
+                    result = await self._request(provider, {
+                        'model': model, 'messages': [{'role': 'user', 'content': '只回复 OK。'}],
+                        'max_tokens': 64,
+                    })
+                    choices = result.get('choices') or []
+                    if not choices or not isinstance(choices[0].get('message'), dict):
+                        raise AIProviderError('测活响应缺少 message')
+                    message = choices[0]['message']
+                    reply = _strip_hidden_reasoning(_message_text(message.get('content')))
+                    limited = choices[0].get('finish_reason') == 'length'
+                    if not (reply or message.get('tool_calls') or limited):
+                        raise AIProviderError('接口成功响应但无有效输出，请检查模型类型与内容限制')
                 return {
                     'model': model, 'ok': True,
                     'latency_ms': round((time.perf_counter() - started) * 1000),
-                    'reply': result['text'][:100], 'error': '',
+                    'reply': reply[:100], 'error': '',
+                    'warning': '输出预算已耗尽，接口连通但尚未生成正文' if limited and not reply else '',
+                    'usage': result.get('usage') or {},
                 }
             except (AIServiceError, aiohttp.ClientError, TimeoutError) as error:
                 health = {
                     'ok': False, 'error': str(error)[:160], 'checked_at': int(time.time()),
                 }
-                self._health[(provider_id, model)] = health
                 return {
                     'model': model, 'ok': False,
                     'latency_ms': round((time.perf_counter() - started) * 1000),
@@ -1530,16 +1596,14 @@ class AIService:
             if target:
                 if apply_results:
                     successful = [item['model'] for item in results if item['ok']]
-                    failed = [item['model'] for item in results if not item['ok']]
-                    tested = set(successful + failed)
                     old_priority = list(target.get('model_priority') or target.get('models') or [])
                     target['model_priority'] = successful + [
                         model for model in old_priority
                         if model not in successful and model in target.get('models', [])
                     ]
                     target['disabled_models'] = [
-                        model for model in target.get('disabled_models', []) if model not in tested
-                    ] + failed
+                        model for model in target.get('disabled_models', []) if model not in successful
+                    ]
                 health = target.setdefault('health', {})
                 for result in results:
                     record = {
@@ -1548,6 +1612,7 @@ class AIService:
                         'checked_at': int(time.time()),
                         'latency_ms': int(result.get('latency_ms') or 0),
                         'reply': str(result.get('reply') or '')[:200],
+                        'warning': str(result.get('warning') or '')[:200],
                     }
                     health[result['model']] = record
                     self._health[(provider_id, result['model'])] = copy.deepcopy(record)
@@ -1555,11 +1620,29 @@ class AIService:
         return results
 
     async def _request(self, provider: dict, payload: dict, run_id: str = '') -> dict:
+        adapted = _adapt_chat_payload(provider, payload)
+        for attempt in range(3):
+            try:
+                return await self._request_once(provider, adapted, run_id)
+            except AIProviderError as error:
+                detail = str(error).lower()
+                if attempt == 2 or not any(code in detail for code in ('http 400', 'http 422')):
+                    raise
+                if 'max_tokens' in detail and 'max_tokens' in adapted:
+                    adapted['max_completion_tokens'] = adapted.pop('max_tokens')
+                elif 'temperature' in detail and 'temperature' in adapted:
+                    adapted.pop('temperature')
+                else:
+                    raise
+
+    async def _request_once(self, provider: dict, payload: dict, run_id: str = '') -> dict:
         headers = _provider_headers(provider, content_type='application/json')
         request_payload = (
             _openai_to_gemini(payload)
             if provider.get('api_type') == 'gemini' else payload
         )
+        if provider.get('api_type') == 'openai_responses':
+            request_payload = _responses_payload(payload)
         endpoint = _provider_endpoint(
             provider, 'chat_path', model=str(payload.get('model') or ''),
         )
@@ -1593,8 +1676,14 @@ class AIService:
             raise
         try:
             data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise AIProviderError('接口返回的 JSON 必须是对象')
+            if data.get('error'):
+                raise AIProviderError(str(data['error'])[:300])
             if provider.get('api_type') == 'gemini':
                 data = _gemini_to_openai(data)
+            elif provider.get('api_type') == 'openai_responses':
+                data = _responses_to_chat(data)
         except json.JSONDecodeError as error:
             if run_id:
                 self.audit.attempt_finish(
@@ -1625,13 +1714,14 @@ class AIService:
             'max_tokens': self._config['max_tokens'] if max_tokens is None else max_tokens,
             'stream': True,
         }
-        if provider.get('api_type') == 'gemini':
+        payload = _adapt_chat_payload(provider, payload)
+        if provider.get('api_type') in {'gemini', 'openai_responses'}:
             payload.pop('stream', None)
             data = await self._request(provider, payload, run_id)
             message = (data.get('choices') or [{}])[0].get('message') or {}
             content = _strip_hidden_reasoning(_message_text(message.get('content')))
             if not content:
-                raise AIProviderError('Gemini 接口返回了空消息')
+                raise AIProviderError('接口返回了空消息，请增加输出预算或检查内容限制')
             yield {
                 'type': 'meta', 'provider_id': provider['id'],
                 'provider_name': provider['name'], 'model': model,
@@ -1643,7 +1733,7 @@ class AIService:
         headers['Accept'] = 'text/event-stream'
         timeout = aiohttp.ClientTimeout(total=self._config['request_timeout'])
 
-        for attempt in range(2):
+        for attempt in range(3):
             attempt_id = self.audit.attempt_start(run_id, provider, model, payload) if run_id else ''
             request_started = time.perf_counter()
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1662,11 +1752,14 @@ class AIService:
                                 response_headers=dict(response.headers),
                             )
                         if (
-                            attempt == 0
+                            attempt < 2 and response.status in {400, 422}
                             and 'max_tokens' in raw.lower()
-                            and 'max_completion_tokens' not in payload
+                            and 'max_tokens' in payload
                         ):
                             payload['max_completion_tokens'] = payload.pop('max_tokens')
+                            continue
+                        if attempt < 2 and response.status in {400, 422} and 'temperature' in raw.lower() and 'temperature' in payload:
+                            payload.pop('temperature')
                             continue
                         raise AIProviderError(f'HTTP {response.status}: {raw[:300]}')
 
@@ -2086,7 +2179,10 @@ class AIService:
             if not tool_calls:
                 text = _strip_tool_protocol(fallback_content, enabled=bool(tools))
                 if not text:
-                    raise AIProviderError('接口返回了空消息')
+                    reason = (data.get('choices') or [{}])[0].get('finish_reason')
+                    if reason == 'length':
+                        raise AIProviderError('输出预算已耗尽但未生成正文，请增加 max_tokens（预算包含推理 token）')
+                    raise AIProviderError(f'接口返回了空消息（finish_reason={reason}），请检查内容限制或模型类型')
                 validation_error = (
                     completion_validator(text, copy.deepcopy(tool_events))
                     if completion_validator is not None else None

@@ -2,7 +2,16 @@
 
 AI LLM 是 ElainaBot 的统一大模型服务模块。接口密钥、模型、优先级和模型能力由模块集中管理，业务插件只负责提交消息和处理自己的业务逻辑。
 
-## 优点
+## 接口兼容与测活
+
+- OpenAI Chat Completions、兼容中转和 Gemini 原生接口继续使用原有配置；Responses 接口请选择 `OpenAI Responses`，默认对话路径为 `/responses`。
+- Responses 支持文本、图片输入、函数调用及工具结果回传，并将 usage 统一到聊天接口字段。当前面板测试在 Responses 请求完成后发送正文，不提供原生逐 token 推送。
+- 已知 OpenAI 推理模型使用 `max_completion_tokens`，省略不兼容的 temperature；其他兼容接口在明确返回参数错误时才调整参数重试，不对超时请求自动重发。
+- 测活每个模型使用最多 64 个输出 token。返回 `finish_reason=length` 且没有正文时，标记接口连通并提示预算耗尽，不再误判为接口不可用。连通并不代表模型在该预算内能生成正文。
+- 测活失败保留现有模型开关，可查看具体错误后手动停用；测活成功会重新启用该模型。以前被测活停用的模型，可重新测活恢复。
+- Base URL 支持填写版本根路径或完整 `/chat/completions`、`/responses` 地址；其他自定义路由通过路径字段配置。
+
+## 能力概览
 
 - **统一管理接口**：集中配置 OpenAI、OpenAI 兼容中转、Gemini、Grok、Agnes、NovelAI、Jimeng2API、Z-Image Gitee 等接口和 API Key。
 - **自动获取模型**：可从接口同步模型列表，并保留已有模型的启用状态与优先级。

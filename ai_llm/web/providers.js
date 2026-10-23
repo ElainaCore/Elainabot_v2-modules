@@ -3,12 +3,14 @@ import { $, api, esc, orderedModels, setState, state, toast } from './core.js';
 const collapsed = new Set();
 const PROVIDER_TYPES = [
   ['openai', 'OpenAI'], ['openai_compatible', 'OpenAI 兼容 / 中转'],
+  ['openai_responses', 'OpenAI Responses'],
   ['gemini', 'Gemini 原生'], ['gemini_openai', 'Gemini OpenAI 兼容'],
   ['grok', 'Grok / xAI'], ['agnes', 'Agnes'], ['novelai', 'NovelAI'],
   ['jimeng2api', 'Jimeng2API'], ['z_image_gitee', 'Z-Image Gitee'],
 ];
 const TYPE_DEFAULTS = {
   openai: {base_url: 'https://api.openai.com/v1'},
+  openai_responses: {base_url: 'https://api.openai.com/v1', chat_path: '/responses'},
   openai_compatible: {base_url: ''},
   gemini: {base_url: 'https://generativelanguage.googleapis.com/v1beta'},
   gemini_openai: {base_url: 'https://generativelanguage.googleapis.com/v1beta/openai'},
@@ -78,16 +80,16 @@ async function probeModels(card, button, loadAll) {
   const dots = [...card.querySelectorAll('.health-dot')];
   const summary = card.querySelector('.health-summary');
   dots.forEach(dot => { dot.className = 'health-dot testing'; });
-  summary.textContent = '正在用“你好”逐模型测活...';
+  summary.textContent = '正在测活（会消耗少量 token，失败不自动停用）...';
   try {
     const item = await saveProvider(card, false, () => {});
     const data = await api('/health', {method: 'POST', body: JSON.stringify({provider_id: item.id, models: item.models, apply_results: true})});
     const results = Object.fromEntries(data.results.map(result => [result.model, result]));
     card.querySelectorAll('.model-row').forEach(row => {
       const result = results[row.dataset.model], dot = row.querySelector('.health-dot');
-      row.querySelector('.model-enabled').checked = result?.ok === true;
+      if (result?.ok) row.querySelector('.model-enabled').checked = true;
       dot.className = 'health-dot ' + (result?.ok ? 'ok' : 'fail');
-      dot.title = result?.ok ? ('可用 · ' + result.latency_ms + 'ms') : (result?.error || '不可用');
+      dot.title = result?.ok ? ((result.warning || '可用') + ' · ' + result.latency_ms + 'ms') : (result?.error || '不可用');
     });
     const ok = data.results.filter(result => result.ok).length;
     summary.textContent = '测活完成：' + ok + '/' + data.results.length + ' 可用';
@@ -117,6 +119,7 @@ export function bindProviders(renderAll, loadAll) {
     const card = select.closest('.provider');
     if (defaults.base_url !== undefined) card.querySelector('[data-key="base_url"]').value = defaults.base_url;
     if (defaults.image_path) card.querySelector('[data-key="image_path"]').value = defaults.image_path;
+    card.querySelector('[data-key="chat_path"]').value = defaults.chat_path || '/chat/completions';
   });
   document.querySelectorAll('.provider input[type=radio]').forEach(input => input.onchange = () => {
     const card = input.closest('.provider');
