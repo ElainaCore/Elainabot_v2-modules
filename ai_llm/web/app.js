@@ -1,6 +1,6 @@
 import {
   $, api, renderCommon, renderTestModels, saveSection as saveConfigSection,
-  readPluginCapabilities, setModelTools, setModelToolMarket, setSkills, setState, state, streamApi, toast,
+  setSkills, setState, state, streamApi, toast,
 } from './core.js';
 import { bindProviders, renderProviders } from './providers.js';
 import { bindLogs, loadLogs } from './logs.js';
@@ -34,39 +34,26 @@ function commitPage(page, epoch, apply) {
   apply();
   if (activePage === page) renderPage(page);
 }
-function mergeCapabilities(kind, items) {
-  const others = (state.plugin_capabilities || []).filter(item => item.kind !== kind);
-  setState({plugin_capabilities: [...others, ...(Array.isArray(items) ? items : [])]});
-}
-function pageTasks(page, epoch, refreshMarket) {
+function pageTasks(page, epoch) {
   const config = section => api('/config?section=' + encodeURIComponent(section)).then(data => commitPage(page, epoch, () => setState(data)));
-  const capabilities = kind => api('/plugin-capabilities?kind=' + encodeURIComponent(kind)).then(data => commitPage(page, epoch, () => mergeCapabilities(kind, data)));
-  if (['overview', 'providers', 'context', 'cron', 'test'].includes(page)) return [config(page)];
+  if (['overview', 'providers', 'context', 'test'].includes(page)) return [config(page)];
   if (page === 'skills') return [
     config('skills'),
     api('/skills').then(data => commitPage(page, epoch, () => setSkills(data))),
-    capabilities('skill'),
   ];
-  if (page === 'tools') return [capabilities('tool')];
-  if (page === 'model-tools') return [
-    config('model-tools'),
-    api('/tools').then(data => commitPage(page, epoch, () => setModelTools(data))),
-    api('/tools/market' + (refreshMarket ? '?refresh=1' : '')).then(data => commitPage(page, epoch, () => setModelToolMarket(data))),
-  ];
-  if (page === 'mcp') return [config('mcp'), capabilities('mcp')];
-  if (page === 'agents') return [capabilities('agent')];
+  if (page === 'mcp') return [config('mcp')];
   if (page === 'logs') return [config('logs').then(() => {
     if (pageEpoch.get(page) === epoch) return loadLogs();
     return undefined;
   })];
   return [];
 }
-async function loadPage(page = activePage, force = false, refreshMarket = false) {
+async function loadPage(page = activePage, force = false) {
   if (!force && loadedPages.has(page)) return;
   if (!force && pageRequests.has(page)) return pageRequests.get(page);
   const epoch = (pageEpoch.get(page) || 0) + 1;
   pageEpoch.set(page, epoch);
-  const request = Promise.allSettled(pageTasks(page, epoch, refreshMarket)).then(results => {
+  const request = Promise.allSettled(pageTasks(page, epoch)).then(results => {
     if (pageEpoch.get(page) !== epoch) return;
     const failed = results.find(result => result.status === 'rejected');
     if (failed) throw failed.reason;
@@ -92,29 +79,6 @@ function bindItems() {
         toast('Skill 已删除');
       } catch (error) { toast(error.message, true); }
       finally { button.disabled = false; }
-    };
-  });
-  document.querySelectorAll('.delete-model-tool').forEach(button => {
-    button.onclick = async () => {
-      const toolId = button.dataset.toolId;
-      if (!confirm('确定删除模型工具“' + toolId + '”？此操作会删除其全部文件。')) return;
-      button.disabled = true;
-      try {
-        await api('/tools?tool_id=' + encodeURIComponent(toolId), {method: 'DELETE'});
-        await loadPage('model-tools', true);
-        toast('模型工具已删除');
-      } catch (error) { toast(error.message, true); }
-      finally { button.disabled = false; }
-    };
-  });
-  document.querySelectorAll('.install-model-tool:not(:disabled)').forEach(button => {
-    button.onclick = async () => {
-      button.disabled = true;
-      try {
-        const item = await api('/tools/install', {method: 'POST', body: JSON.stringify({tool_id: button.dataset.toolId})});
-        await loadPage('model-tools', true);
-        toast('模型工具 ' + item.id + ' 已安装');
-      } catch (error) { toast(error.message, true); button.disabled = false; }
     };
   });
 }
@@ -180,42 +144,14 @@ $('skill-upload-form').onsubmit = async event => {
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
 };
-$('model-tool-upload-form').onsubmit = async event => {
-  event.preventDefault();
-  const file = $('model-tool-file').files[0];
-  if (!file) return toast('请选择模型工具文件', true);
-  const button = $('upload-model-tool');
-  const form = new FormData();
-  form.append('file', file, file.name);
-  button.disabled = true;
-  try {
-    const item = await api('/tools', {method: 'POST', body: form});
-    $('model-tool-upload-form').reset();
-    await loadPage('model-tools', true);
-    toast('模型工具 ' + item.id + ' 已上传');
-  } catch (error) { toast(error.message, true); }
-  finally { button.disabled = false; }
-};
-$('refresh-model-tool-market').onclick = () => loadPage('model-tools', true, true).then(() => toast('模型工具市场已刷新')).catch(error => toast(error.message, true));
 $('add-mcp').onclick = () => {
   setState({...state, mcp: {...state.mcp, servers: [...(state.mcp?.servers || []), {id: 'mcp-' + Date.now(), name: '新 MCP', endpoint: '', headers: {}, timeout: 20, enabled: true}]}});
   renderPage();
 };
-$('add-cron').onclick = () => addItem('cron_jobs', {id: 'cron-' + Date.now(), name: '新任务', cron: '', interval_seconds: 3600, prompt: '', provider_id: '', model: '', enabled: true});
 $('refresh-mcp').onclick = async () => {
   try { await saveConfigSection('mcp'); const data = await api('/mcp/refresh', {method: 'POST'}); await loadPage('mcp', true); toast('已注册 ' + data.tools.length + ' 个 MCP 工具'); }
   catch (error) { toast(error.message, true); }
 };
-document.querySelectorAll('.save-plugin-capabilities').forEach(button => button.onclick = async () => {
-  button.disabled = true;
-  try {
-    const data = await api('/plugin-capabilities', {method: 'PUT', body: JSON.stringify({items: readPluginCapabilities()})});
-    setState({...state, plugin_capabilities: data.items || []});
-    renderPage();
-    toast('插件能力设置已保存');
-  } catch (error) { toast(error.message, true); }
-  finally { button.disabled = false; }
-});
 $('test-provider').onchange = renderTestModels;
 $('run-test').onclick = async () => {
   const button = $('run-test');

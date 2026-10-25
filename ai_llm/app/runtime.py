@@ -86,10 +86,6 @@ class AgentRuntime:
         self._mcp_tools: dict[str, tuple[dict, str]] = {}
         self._mcp_schemas: dict[str, dict] = {}
         self._mcp_errors: dict[str, str] = {}
-        self._plugin_mcp_tools: dict[str, dict[str, tuple[dict, dict, str]]] = {}
-        self._cron_task: asyncio.Task | None = None
-        self._cron_seen: dict[str, float] = {}
-        self._emit = None
         self._skills_cache_key = None
         self._skills_cache: list[dict] = []
 
@@ -97,10 +93,7 @@ class AgentRuntime:
         running = sum(1 for item in self._runs.values() if item['status'] == 'running')
         result = {
             'running': running,
-            'mcp_tools': len(self._mcp_tools) + sum(
-                len(items) for items in self._plugin_mcp_tools.values()
-            ),
-            'cron_active': bool(self._cron_task and not self._cron_task.done()),
+            'mcp_tools': len(self._mcp_tools),
         }
         if details:
             result['runs'] = [
@@ -338,9 +331,12 @@ class AgentRuntime:
         return [summary, *recent]
 
     async def tools(
-        self, *, allow_handoff: bool = True, consumer_plugin: str = '',
-        capability_types: list[str] | None = None, context: dict | None = None,
+        self, *, capability_types: list[str] | None = None,
     ) -> list[dict]:
+        """中央运行时工具（Skills 与面板配置的 MCP）。
+
+        插件注册的私有工具由 service.complete 直接注入，不经过本方法。
+        """
         config = self.service.config()
         result = []
         allowed_types = {str(item).lower() for item in (capability_types or []) if str(item)}
@@ -362,10 +358,6 @@ class AgentRuntime:
                     },
                 },
             })
-        if allow_type('tool') and config.get('model_tools_enabled'):
-            result.extend(self.service.model_tool_definitions(
-                None, consumer_plugin=consumer_plugin, context=context,
-            ))
         if allow_type('mcp') and config.get('mcp', {}).get('enabled'):
             await self.refresh_mcp_tools()
             for name, (server, original) in self._mcp_tools.items():
@@ -378,152 +370,20 @@ class AgentRuntime:
                         'parameters': schema.get('inputSchema') or {'type': 'object', 'properties': {}},
                     },
                 })
-        capabilities = (
-            self.service.plugin_capabilities(consumer_plugin=consumer_plugin)
-            if consumer_plugin else []
-        )
-        capabilities = [item for item in capabilities if item.get('online')]
-        plugin_skills = [item for item in capabilities if item.get('kind') == 'skill']
-        if allow_type('skill') and plugin_skills:
-            result.append({
-                'type': 'function',
-                'function': {
-                    'name': 'load_plugin_skill',
-                    'description': '读取当前插件获准使用的注入 Skill。',
-                    'parameters': {
-                        'type': 'object',
-                        'properties': {
-                            'capability_key': {
-                                'type': 'string',
-                                'enum': [item['key'] for item in plugin_skills],
-                            },
-                        },
-                        'required': ['capability_key'],
-                    },
-                },
-            })
-        plugin_agents = [item for item in capabilities if item.get('kind') == 'agent']
-        if allow_type('agent') and allow_handoff and plugin_agents:
-            result.append({
-                'type': 'function',
-                'function': {
-                    'name': 'delegate_plugin_agent',
-                    'description': '将独立子任务交给当前插件获准使用的注入 Agent。',
-                    'parameters': {
-                        'type': 'object',
-                        'properties': {
-                            'capability_key': {
-                                'type': 'string',
-                                'enum': [item['key'] for item in plugin_agents],
-                            },
-                            'task': {'type': 'string'},
-                        },
-                        'required': ['capability_key', 'task'],
-                    },
-                },
-            })
-        if allow_type('tool'):
-            for item in (value for value in capabilities if value.get('kind') == 'tool'):
-                schema = item.get('config', {}).get('schema', {})
-                name = _TOOL_NAME.sub('_', f"plugin_{item['source_plugin']}_{item['id']}")[:64]
-                result.append({
-                    'type': 'function',
-                    'function': {
-                        'name': name,
-                        'description': item.get('description') or item.get('name') or name,
-                        'parameters': schema if isinstance(schema, dict) else {
-                            'type': 'object', 'properties': {},
-                        },
-                    },
-                })
-        if allow_type('mcp'):
-            await self.refresh_plugin_mcp_tools(consumer_plugin)
-            for name, (capability, _server, original) in self._plugin_mcp_tools.get(
-                consumer_plugin, {}
-            ).items():
-                if not self.service._capability_allowed(capability, consumer_plugin):
-                    continue
-                schema = copy.deepcopy(self._mcp_schemas.get(name, {}))
-                result.append({
-                    'type': 'function',
-                    'function': {
-                        'name': name,
-                        'description': str(schema.get('description') or f'MCP tool {original}'),
-                        'parameters': schema.get('inputSchema') or {
-                            'type': 'object', 'properties': {},
-                        },
-                    },
-                })
         return result
 
     async def call_tool(
-        self, name: str, arguments: dict, *, consumer_plugin: str = '', context: dict | None = None,
+        self, name: str, arguments: dict,
     ) -> dict | None:
-        model_tool_result = await self.service.call_model_tool(
-            name, arguments, consumer_plugin=consumer_plugin, context=context,
-        )
-        if model_tool_result is not None:
-            return model_tool_result
         if name == 'load_skill':
             return self.load_skill(str(arguments.get('skill_id') or ''))
-        if name == 'load_plugin_skill' and consumer_plugin:
-            key = str(arguments.get('capability_key') or '')
-            item = next((value for value in self.service.plugin_capabilities(
-                consumer_plugin=consumer_plugin, kind='skill',
-            ) if value.get('key') == key), None)
-            return {'ok': True, 'capability_key': key, 'content': item.get('content', '')} if item else {
-                'ok': False, 'error': 'Skill 不存在或当前插件无权使用',
-            }
-        if name == 'delegate_plugin_agent' and consumer_plugin:
-            return await self._delegate_plugin_agent(arguments, consumer_plugin)
         if name in self._mcp_tools:
             server, original = self._mcp_tools[name]
             payload = await self._mcp_rpc(server, 'tools/call', {
                 'name': original, 'arguments': arguments,
             })
             return {'ok': True, 'result': payload.get('result', payload)}
-        plugin_mcp_tools = self._plugin_mcp_tools.get(consumer_plugin, {})
-        if name in plugin_mcp_tools:
-            capability, server, original = plugin_mcp_tools[name]
-            if not self.service._capability_allowed(capability, consumer_plugin):
-                return {'ok': False, 'error': '当前插件无权使用此 MCP 工具'}
-            payload = await self._mcp_rpc(server, 'tools/call', {
-                'name': original, 'arguments': arguments,
-            })
-            return {'ok': True, 'result': payload.get('result', payload)}
-        for item in (
-            self.service.plugin_capabilities(consumer_plugin=consumer_plugin, kind='tool')
-            if consumer_plugin else []
-        ):
-            safe = _TOOL_NAME.sub('_', f"plugin_{item['source_plugin']}_{item['id']}")[:64]
-            if safe != name:
-                continue
-            handler = self.service.capability_handler(item['key'])
-            if handler is None:
-                return {'ok': False, 'error': '插件能力当前不在线'}
-            value = handler(item['id'], arguments)
-            return await value if asyncio.iscoroutine(value) else value
         return None
-
-    async def _delegate_plugin_agent(self, arguments: dict, consumer_plugin: str) -> dict:
-        if not consumer_plugin:
-            return {'ok': False, 'error': '缺少调用插件身份'}
-        key = str(arguments.get('capability_key') or '')
-        item = next((value for value in self.service.plugin_capabilities(
-            consumer_plugin=consumer_plugin, kind='agent',
-        ) if value.get('key') == key), None)
-        if item is None:
-            return {'ok': False, 'error': 'Agent 不存在或当前插件无权使用'}
-        settings = item.get('config', {})
-        result = await self.service.run_agent(
-            [{'role': 'user', 'content': str(arguments.get('task') or '')[:12000]}],
-            system_prompt=str(item.get('content') or settings.get('system_prompt') or ''),
-            provider_id=str(settings.get('provider_id') or ''),
-            model=str(settings.get('model') or ''),
-            allow_handoff=False,
-            consumer_plugin=consumer_plugin,
-        )
-        return {'ok': True, 'capability_key': key, 'text': result['text']}
 
     async def refresh_mcp_tools(self) -> list[dict]:
         self._mcp_tools.clear()
@@ -549,41 +409,6 @@ class AgentRuntime:
             {'name': name, 'server_id': server.get('id'), 'original_name': original}
             for name, (server, original) in self._mcp_tools.items()
         ]
-
-    async def refresh_plugin_mcp_tools(self, consumer_plugin: str = '') -> list[dict]:
-        if not consumer_plugin:
-            return []
-        previous = self._plugin_mcp_tools.get(consumer_plugin, {})
-        for name in previous:
-            self._mcp_schemas.pop(name, None)
-        current: dict[str, tuple[dict, dict, str]] = {}
-        self._plugin_mcp_tools[consumer_plugin] = current
-        allowed = self.service.plugin_capabilities(
-            consumer_plugin=consumer_plugin, kind='mcp',
-        )
-        allowed = [item for item in allowed if item.get('online')]
-        result = []
-        for capability in allowed:
-            server = copy.deepcopy(capability.get('config') or {})
-            server.setdefault('id', capability['key'])
-            if not server.get('enabled', True) or not server.get('endpoint'):
-                continue
-            try:
-                payload = await self._mcp_rpc(server, 'tools/list', {})
-                for item in payload.get('result', {}).get('tools', []):
-                    original = str(item.get('name') or '')
-                    if not original:
-                        continue
-                    safe = _TOOL_NAME.sub('_', f"mcp_{capability['source_plugin']}_{capability['id']}_{original}")[:64]
-                    current[safe] = (capability, server, original)
-                    self._mcp_schemas[safe] = item
-                    result.append({
-                        'name': safe, 'capability_key': capability['key'],
-                        'original_name': original,
-                    })
-            except Exception as error:  # noqa: BLE001
-                self._mcp_errors[capability['key']] = _redact(error)[:160]
-        return result
 
     async def _mcp_rpc(self, server: dict, method: str, params: dict) -> dict:
         endpoint = _public_url(str(server.get('endpoint') or ''))
@@ -655,8 +480,15 @@ class AgentRuntime:
             item['finished_at'] = int(time.time())
             item.pop('task', None)
         if len(self._runs) > 100:
-            for key in list(self._runs)[:-100]:
-                self._runs.pop(key, None)
+            for key in list(self._runs):
+                if len(self._runs) <= 100:
+                    break
+                if self._runs[key]['status'] != 'running':
+                    self._runs.pop(key, None)
+        self._session_runs = {
+            session: target for session, target in self._session_runs.items()
+            if target in self._runs
+        }
 
     def interrupt(self, target: str) -> bool:
         run_id = self._session_runs.get(target, target)
@@ -669,88 +501,14 @@ class AgentRuntime:
         task.cancel()
         return True
 
-    async def start(self, emit=None) -> None:
-        self._emit = emit
-        if self._cron_task is None or self._cron_task.done():
-            self._cron_task = asyncio.create_task(self._cron_loop())
 
     async def stop(self) -> None:
-        if self._cron_task and not self._cron_task.done():
-            self._cron_task.cancel()
-            try:
-                await self._cron_task
-            except asyncio.CancelledError:
-                pass
+        tasks = set()
+        current = asyncio.current_task()
         for item in self._runs.values():
             task = item.get('task')
-            if task and not task.done():
+            if task and task is not current and not task.done():
                 task.cancel()
-
-    async def _cron_loop(self) -> None:
-        while True:
-            await asyncio.sleep(15)
-            now = time.time()
-            minute = time.localtime(now)
-            for job in self.service.config().get('cron_jobs', []):
-                if not job.get('enabled') or not job.get('prompt'):
-                    continue
-                job_id = str(job.get('id') or '')
-                due = False
-                interval = int(job.get('interval_seconds') or 0)
-                run_at = int(job.get('run_at') or 0)
-                if run_at > 0:
-                    due = now >= run_at and job_id not in self._cron_seen
-                elif interval > 0:
-                    due = now - self._cron_seen.get(job_id, 0) >= max(60, interval)
-                elif job.get('cron'):
-                    fields = str(job['cron']).split()
-                    if len(fields) == 5:
-                        values = [minute.tm_min, minute.tm_hour, minute.tm_mday, minute.tm_mon, minute.tm_wday]
-                        due = all(field == '*' or str(value) in field.split(',') for field, value in zip(fields, values))
-                        due = due and now - self._cron_seen.get(job_id, 0) >= 60
-                if not due:
-                    continue
-                self._cron_seen[job_id] = now
-                asyncio.create_task(self._run_cron(job))
-
-    async def _run_cron(self, job: dict) -> None:
-        try:
-            result = await self.service.run_agent(
-                [{'role': 'user', 'content': str(job.get('prompt') or '')}],
-                system_prompt=str(job.get('system_prompt') or ''),
-                provider_id=str(job.get('provider_id') or ''),
-                model=str(job.get('model') or ''),
-                session_id=f"cron:{job.get('id')}",
-                tool_context={'cron_job': copy.deepcopy(job)},
-            )
-            target_type = str(job.get('target_type') or '')
-            target_id = str(job.get('target_id') or '')
-            if target_type and target_id:
-                from core.bot.manager import _bot_manager_ref
-                bot = _bot_manager_ref.get_bot(job.get('appid')) if _bot_manager_ref else None
-                sender = getattr(bot, 'sender', None)
-                text = str(result.get('text') or '').strip()
-                if sender is None:
-                    raise RuntimeError('定时任务对应的机器人当前不在线')
-                if text:
-                    if target_type == 'group':
-                        creator = str(job.get('creator_user_id') or '')
-                        content = f'<@{creator}> {text}' if creator else text
-                        await sender.send_to_group(target_id, content)
-                    elif target_type == 'direct':
-                        await sender.send_to_user(target_id, text)
-                    elif target_type == 'channel':
-                        await sender.send_to_channel(target_id, text)
-            if self._emit:
-                await self._emit('ai_cron_result', {
-                    'job_id': job.get('id'), 'name': job.get('name'), 'result': result,
-                })
-        except Exception as error:  # noqa: BLE001
-            if self._emit:
-                await self._emit('ai_cron_result', {
-                    'job_id': job.get('id'), 'name': job.get('name'), 'error': _redact(error),
-                })
-        finally:
-            if job.get('one_shot'):
-                await self.service.consume_one_shot_task(job.get('id'))
-                self._cron_seen.pop(str(job.get('id') or ''), None)
+                tasks.add(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

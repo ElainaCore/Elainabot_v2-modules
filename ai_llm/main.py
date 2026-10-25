@@ -13,14 +13,13 @@ from core.base.config import cfg
 from core.base.logger import EXTENSION, get_logger
 from core.plugin.web_pages import register_page, register_route, unregister_page, unregister_route
 
-from .app import model_tool_market
 from .app.migration import load_ai_dev_config
 from .app.service import DEFAULT_CONFIG, AIService
 
 __module_meta__ = {
     'name': 'AI LLM 服务',
-    'description': '统一管理模型、工具、Agent、MCP、Skills 和计划任务',
-    'version': '1.2.5',
+    'description': '统一管理模型接口、工具执行、MCP、Skills 与调用日志',
+    'version': '1.3.1',
     'author': 'ElainaBot',
 }
 
@@ -59,7 +58,6 @@ async def setup(ctx):
         ctx.save_config(value)
 
     _instance = AIService(config, save, ctx.data_dir)
-    await _instance.runtime.start(ctx.emit)
     register_route('GET', f'{PREFIX}/config', _get_config)
     register_route('PUT', f'{PREFIX}/config', _save_config)
     register_route('POST', f'{PREFIX}/models', _models)
@@ -70,13 +68,6 @@ async def setup(ctx):
     register_route('GET', f'{PREFIX}/skills', _skills)
     register_route('POST', f'{PREFIX}/skills', _upload_skill)
     register_route('DELETE', f'{PREFIX}/skills', _delete_skill)
-    register_route('GET', f'{PREFIX}/tools', _tools)
-    register_route('POST', f'{PREFIX}/tools', _upload_tool)
-    register_route('DELETE', f'{PREFIX}/tools', _delete_tool)
-    register_route('GET', f'{PREFIX}/tools/market', _tool_market)
-    register_route('POST', f'{PREFIX}/tools/install', _install_tool)
-    register_route('GET', f'{PREFIX}/plugin-capabilities', _plugin_capabilities)
-    register_route('PUT', f'{PREFIX}/plugin-capabilities', _save_plugin_capabilities)
     register_route('POST', f'{PREFIX}/mcp/refresh', _mcp_refresh)
     register_route('POST', f'{PREFIX}/interrupt', _interrupt)
     register_route('GET', f'{PREFIX}/logs', _logs)
@@ -102,7 +93,7 @@ async def teardown():
         _refresh_task.cancel()
     _refresh_task = None
     if _instance is not None:
-        await _instance.runtime.stop()
+        await _instance.close()
     for method, path in (
         ('GET', f'{PREFIX}/config'),
         ('PUT', f'{PREFIX}/config'),
@@ -114,13 +105,6 @@ async def teardown():
         ('GET', f'{PREFIX}/skills'),
         ('POST', f'{PREFIX}/skills'),
         ('DELETE', f'{PREFIX}/skills'),
-        ('GET', f'{PREFIX}/tools'),
-        ('POST', f'{PREFIX}/tools'),
-        ('DELETE', f'{PREFIX}/tools'),
-        ('GET', f'{PREFIX}/tools/market'),
-        ('POST', f'{PREFIX}/tools/install'),
-        ('GET', f'{PREFIX}/plugin-capabilities'),
-        ('PUT', f'{PREFIX}/plugin-capabilities'),
         ('POST', f'{PREFIX}/mcp/refresh'),
         ('POST', f'{PREFIX}/interrupt'),
         ('GET', f'{PREFIX}/logs'),
@@ -293,93 +277,6 @@ async def _delete_skill(request):
             return web.json_response({'success': False, 'error': 'Skill 不存在'}, status=404)
         return web.json_response({'success': True, 'data': {'deleted': True}})
     except (ValueError, RuntimeError, OSError) as error:
-        return web.json_response({'success': False, 'error': str(error)}, status=400)
-
-
-async def _tools(_request):
-    return web.json_response({'success': True, 'data': _service().model_tool_catalog()})
-
-
-async def _upload_tool(request):
-    try:
-        reader = await request.multipart()
-        filename, content = '', b''
-        async for part in reader:
-            if part.name != 'file':
-                continue
-            filename = part.filename or ''
-            chunks, size = [], 0
-            while True:
-                chunk = await part.read_chunk(64 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > 20 * 1024 * 1024:
-                    return web.json_response({
-                        'success': False, 'error': '模型工具文件不能超过 20 MB',
-                    }, status=413)
-                chunks.append(chunk)
-            content = b''.join(chunks)
-        if not filename:
-            return web.json_response({'success': False, 'error': '请选择模型工具文件'}, status=400)
-        item = _service().model_tool_store.upload(filename, content)
-        return web.json_response({'success': True, 'data': item}, status=201)
-    except (ValueError, RuntimeError, OSError) as error:
-        return web.json_response({'success': False, 'error': str(error)}, status=400)
-
-
-async def _delete_tool(request):
-    try:
-        deleted = _service().model_tool_store.delete(request.query.get('tool_id', ''))
-        if not deleted:
-            return web.json_response({'success': False, 'error': '模型工具不存在'}, status=404)
-        return web.json_response({'success': True, 'data': {'deleted': True}})
-    except (ValueError, RuntimeError, OSError) as error:
-        return web.json_response({'success': False, 'error': str(error)}, status=400)
-
-
-async def _tool_market(request):
-    try:
-        installed = {item['id'] for item in _service().model_tool_store.catalog()}
-        items = [
-            {**item, 'installed': item['id'] in installed}
-            for item in await model_tool_market.catalog(force=request.query.get('refresh') == '1')
-        ]
-        return web.json_response({'success': True, 'data': items})
-    except (ValueError, RuntimeError, OSError, aiohttp.ClientError) as error:
-        return web.json_response({'success': False, 'error': str(error)}, status=502)
-
-
-async def _install_tool(request):
-    body = await _json(request)
-    try:
-        item = await model_tool_market.install(
-            _service().model_tool_store, str(body.get('tool_id') or ''),
-        )
-        return web.json_response({'success': True, 'data': item}, status=201)
-    except (ValueError, RuntimeError, OSError, aiohttp.ClientError) as error:
-        return web.json_response({'success': False, 'error': str(error)}, status=400)
-
-
-async def _plugin_capabilities(request):
-    kind = str(request.query.get('kind') or '').strip().lower()
-    if kind and kind not in {'skill', 'agent', 'mcp', 'tool'}:
-        return web.json_response({'success': False, 'error': '能力类型无效'}, status=400)
-    return web.json_response({
-        'success': True,
-        'data': _service().plugin_capabilities(kind=kind, public=True),
-    })
-
-
-async def _save_plugin_capabilities(request):
-    body = await _json(request)
-    items = body.get('items')
-    if not isinstance(items, list):
-        return web.json_response({'success': False, 'error': 'items 必须是数组'}, status=400)
-    try:
-        data = await _service().save_plugin_capabilities(items)
-        return web.json_response({'success': True, 'data': {'items': data}})
-    except (TypeError, ValueError) as error:
         return web.json_response({'success': False, 'error': str(error)}, status=400)
 
 
