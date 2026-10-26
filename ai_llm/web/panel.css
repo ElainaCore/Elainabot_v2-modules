@@ -123,3 +123,11 @@ body.log-modal-open{overflow:hidden}
 @media(max-width:760px){.model-list,.skill-list{grid-template-columns:1fr}}
 
 :is(.content,.nav){scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--text3) 30%,transparent) transparent}
+
+.provider-advanced{margin-top:20px;border-top:1px solid var(--message-line);padding-top:16px}
+.provider-advanced summary,.model-zone summary{cursor:pointer;color:var(--text2);font-size:12px;font-weight:600;padding:6px 0}
+.provider-help{color:var(--text3);font-size:11px;line-height:1.7;margin:12px 0 16px}
+.provider-advanced .switches{margin-top:16px}.model-zone[open] summary{margin-bottom:14px}
+.provider-balance[hidden]{display:none}.model-zone:not([open]){padding-bottom:0}
+
+.agent-code{font-family:ui-monospace,Consolas,monospace!important;tab-size:4}#agent-editor[hidden]{display:none}.agent-tool-meta{padding:0 16px 14px;font-size:12px;color:var(--text2);line-height:1.7}

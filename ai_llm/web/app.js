@@ -1,8 +1,9 @@
+import {bindAgentTools, loadAgentTools} from './agent-tools.js';
 import {
   $, api, renderCommon, renderTestModels, saveSection as saveConfigSection,
   setSkills, setState, state, streamApi, toast,
 } from './core.js';
-import { bindProviders, renderProviders } from './providers.js';
+import { bindProviders, renderProviders, resetProviderExpansion } from './providers.js';
 import { bindLogs, loadLogs } from './logs.js';
 
 const pages = new Set([...document.querySelectorAll('.nav button')].map(button => button.dataset.page));
@@ -37,6 +38,7 @@ function commitPage(page, epoch, apply) {
 function pageTasks(page, epoch) {
   const config = section => api('/config?section=' + encodeURIComponent(section)).then(data => commitPage(page, epoch, () => setState(data)));
   if (['overview', 'providers', 'context', 'test'].includes(page)) return [config(page)];
+  if (page === 'agent-tools') return [loadAgentTools()];
   if (page === 'skills') return [
     config('skills'),
     api('/skills').then(data => commitPage(page, epoch, () => setSkills(data))),
@@ -91,6 +93,7 @@ function pageFromLocation() {
   return pages.has(value) ? value : 'overview';
 }
 function showPage(page) {
+  if (page === 'providers' && activePage !== 'providers') resetProviderExpansion();
   activePage = pages.has(page) ? page : 'overview';
   document.querySelectorAll('.nav button').forEach(button => button.classList.toggle('active', button.dataset.page === activePage));
   document.querySelectorAll('.page').forEach(section => section.classList.toggle('active', section.id === 'page-' + activePage));
@@ -126,7 +129,7 @@ $('reload').onclick = () => loadPage(activePage, true).then(() => {
 document.querySelectorAll('.save-section').forEach(button => button.onclick = () =>
   saveConfigSection(button.dataset.section).then(() => { renderPage(); toast('配置已保存'); }).catch(error => toast(error.message, true))
 );
-$('add-provider').onclick = () => addItem('providers', {id: 'provider-' + Date.now(), name: '新接口', api_type: 'openai_compatible', base_url: '', api_key: '', model: '', models: [], model_priority: [], disabled_models: [], chat_path: '/chat/completions', models_path: '/models', image_path: '/images/generations', image_edit_path: '/images/edits', model_priority_enabled: true, priority: 50, enabled: true});
+$('add-provider').onclick = () => addItem('providers', {id: 'provider-' + Date.now(), name: '新接口', api_type: 'openai_compatible', base_url: '', api_key: '', model: '', models: [], model_priority: [], disabled_models: [], model_priority_enabled: true, priority: 50, enabled: true});
 $('skill-upload-form').onsubmit = async event => {
   event.preventDefault();
   const file = $('skill-file').files[0];
@@ -181,6 +184,7 @@ $('interrupt-test').onclick = async () => {
   catch (error) { toast(error.message, true); }
 };
 bindLogs();
+bindAgentTools();
 activePage = pageFromLocation();
 if (!location.hash) history.replaceState(null, '', '#overview');
 showPage(activePage);

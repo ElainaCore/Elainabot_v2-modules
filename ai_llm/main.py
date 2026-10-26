@@ -35,6 +35,7 @@ _ASSET_FILES = {
     'providers.js': 'text/javascript',
     'app.js': 'text/javascript',
     'logs.js': 'text/javascript',
+    'agent-tools.js': 'text/javascript',
 }
 
 
@@ -61,6 +62,9 @@ async def setup(ctx):
     register_route('GET', f'{PREFIX}/config', _get_config)
     register_route('PUT', f'{PREFIX}/config', _save_config)
     register_route('POST', f'{PREFIX}/models', _models)
+    register_route('GET', f'{PREFIX}/balances', _balances)
+    for method, path, handler in _agent_routes():
+        register_route(method, PREFIX + path, handler)
     register_route('POST', f'{PREFIX}/health', _health)
     register_route('POST', f'{PREFIX}/refresh-all', _refresh_all)
     register_route('POST', f'{PREFIX}/test', _test)
@@ -94,10 +98,13 @@ async def teardown():
     _refresh_task = None
     if _instance is not None:
         await _instance.close()
+    for method, path, _handler in _agent_routes():
+        unregister_route(method, PREFIX + path)
     for method, path in (
         ('GET', f'{PREFIX}/config'),
         ('PUT', f'{PREFIX}/config'),
         ('POST', f'{PREFIX}/models'),
+        ('GET', f'{PREFIX}/balances'),
         ('POST', f'{PREFIX}/health'),
         ('POST', f'{PREFIX}/refresh-all'),
         ('POST', f'{PREFIX}/test'),
@@ -177,6 +184,73 @@ async def _models(request):
         return web.json_response({'success': True, 'data': {'models': models}})
     except (RuntimeError, OSError) as error:
         return web.json_response({'success': False, 'error': str(error)}, status=502)
+
+
+async def _balances(_request):
+    return web.json_response({'success': True, 'data': await _service().provider_balances()})
+
+
+def _agent_routes():
+    return [('GET', '/agent-tools', _agent_tools), ('POST', '/agent-tools', _agent_save),
+            ('PUT', '/agent-tools', _agent_save), ('DELETE', '/agent-tools', _agent_delete),
+            ('POST', '/agent-tools/download', _agent_download),
+            ('POST', '/agent-tools/create', _agent_create), ('POST', '/agent-tools/test', _agent_test)]
+
+
+async def _agent_tools(request):
+    identifier = str(request.query.get('id') or '')
+    try:
+        store = _service().public_tools
+        data = store.get(identifier) if identifier else store.status()
+        return web.json_response({'success': True, 'data': data})
+    except ValueError as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=404)
+
+
+async def _agent_save(request):
+    try:
+        item = await asyncio.to_thread(_service().public_tools.save, await _json(request), replace=request.method == 'PUT')
+        return web.json_response({'success': True, 'data': item})
+    except (ValueError, TypeError, OSError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=400)
+
+
+async def _agent_delete(request):
+    try:
+        await asyncio.to_thread(_service().public_tools.delete, str(request.query.get('id') or ''))
+        return web.json_response({'success': True, 'data': {'deleted': True}})
+    except (ValueError, OSError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=400)
+
+
+async def _agent_download(request):
+    body = await _json(request)
+    try:
+        item = await _service().public_tools.download(url=str(body.get('url') or ''), builtin=str(body.get('builtin') or ''))
+        return web.json_response({'success': True, 'data': item})
+    except (ValueError, TypeError, OSError, aiohttp.ClientError, TimeoutError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=400)
+
+
+async def _agent_create(request):
+    body = await _json(request)
+    try:
+        item = await _service().create_public_tool(str(body.get('requirement') or ''),
+            provider_id=str(body.get('provider_id') or ''), model=str(body.get('model') or ''),
+            consumer_plugin=body.get('consumer_plugin', ''), tool_id=body.get('tool_id', ''),
+            provider_ids=body.get('provider_ids'), models=body.get('models'))
+        return web.json_response({'success': True, 'data': item})
+    except (ValueError, TypeError, OSError, RuntimeError, aiohttp.ClientError, TimeoutError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=400)
+
+
+async def _agent_test(request):
+    body = await _json(request)
+    try:
+        result = await _service().public_tools.call(str(body.get('id') or ''), body.get('arguments', {}), allow_disabled=True)
+        return web.json_response({'success': True, 'data': result})
+    except (ValueError, TypeError, OSError) as error:
+        return web.json_response({'success': False, 'error': str(error)}, status=400)
 
 
 async def _health(request):

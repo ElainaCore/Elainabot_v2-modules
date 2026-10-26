@@ -20,8 +20,10 @@ from xml.etree import ElementTree
 import aiohttp
 
 from .tools import PluginToolRegistry
+from .balance import BalanceReader
 from .audit import InvocationAudit
 from .runtime import AgentRuntime
+from .public_tools import PublicToolStore
 
 ToolHandler = Callable[[str, dict], Awaitable[dict] | dict]
 CompletionValidator = Callable[[str, list[dict]], str | None]
@@ -382,13 +384,21 @@ _PROVIDER_PATH_DEFAULTS = {
 }
 
 
+def provider_paths(api_type: str) -> dict[str, str]:
+    paths = dict(_PROVIDER_PATH_DEFAULTS)
+    if api_type == 'openai_responses':
+        paths['chat_path'] = '/responses'
+    elif api_type == 'gemini':
+        paths['chat_path'] = '/models/{model}:generateContent'
+    elif api_type == 'novelai':
+        paths['image_path'] = '/ai/generate-image'
+    return paths
+
+
 def _provider_endpoint(provider: dict, key: str, *, model: str = '') -> str:
     base = str(provider.get('base_url') or '').rstrip('/')
-    if provider.get('api_type') == 'gemini' and key == 'chat_path':
-        return f"{base}/models/{quote(model, safe='')}:generateContent"
-    path = str(provider.get(key) or _PROVIDER_PATH_DEFAULTS[key]).strip()
-    if provider.get('api_type') == 'openai_responses' and key == 'chat_path' and path == '/chat/completions':
-        path = '/responses'
+    path = str(provider.get(key) or provider_paths(provider.get('api_type', ''))[key]).strip()
+    path = path.replace('{model}', quote(model, safe=''))
     for suffix in ('/chat/completions', '/responses'):
         if base.endswith(suffix):
             base = base[:-len(suffix)]
@@ -641,8 +651,15 @@ def normalize_config(value: dict | None) -> dict:
         item['priority'] = min(10000, max(0, int(item.get('priority', 100))))
         item['model_priority_enabled'] = bool(item.get('model_priority_enabled', True))
         for key, default in _PROVIDER_PATH_DEFAULTS.items():
-            path = str(item.get(key) or default).strip()[:256]
-            item[key] = '/' + path.lstrip('/')
+            path = str(item.get(key) or '').strip()[:256]
+            # Old versions persisted generic defaults; blank now means type-aware automatic routing.
+            if path == default and not item.get('custom_paths'):
+                path = ''
+            if path and (not path.startswith('/') or path.startswith('//') or '?' in path or '#' in path):
+                raise ValueError('自定义请求路径必须以单个 / 开头，不包含查询参数或域名')
+            item[key] = path
+        item['balance_enabled'] = bool(item.get('balance_enabled', True))
+        item['custom_paths'] = True
         models = item.get('models', [])
         if not isinstance(models, list):
             models = []
@@ -742,7 +759,9 @@ class AIService:
                 if isinstance(health, dict):
                     self._health[(provider['id'], model)] = copy.deepcopy(health)
         self.tool_registry = PluginToolRegistry()
+        self._balance_reader = BalanceReader()
         self.runtime = AgentRuntime(self, data_dir or '.')
+        self.public_tools = PublicToolStore(self.runtime.data_dir)
         self._archive_retired_settings(config)
         self.audit = InvocationAudit(data_dir or '.')
         self.audit.set_include_content(self._config.get('audit_include_content', False))
@@ -761,6 +780,7 @@ class AIService:
 
     async def close(self) -> None:
         await self.runtime.stop()
+        await self.public_tools.close()
         self.tool_registry.clear()
 
     def register_plugin_tools(
@@ -780,6 +800,84 @@ class AIService:
     def plugin_tool_snapshot(self) -> dict[str, list[str]]:
         """返回 {插件名: [工具名]} 快照（管理面板用）。"""
         return self.tool_registry.snapshot()
+
+    async def provider_balances(self) -> dict:
+        providers = copy.deepcopy(self._config['providers'])
+        results = await asyncio.gather(*(self._balance_reader.read(item) for item in providers))
+        return {item['id']: result for item, result in zip(providers, results)}
+
+    def model_tool_catalog(self, *, consumer_plugin: str = '') -> list[dict]:
+        """Only centrally installed public tools; never publish plugin registrations."""
+        return self.public_tools.catalog()
+
+    def model_tool_definitions(self, selected=None, *, consumer_plugin: str = '', context: dict | None = None) -> list[dict]:
+        context = context or {}
+        provider = self._provider(str(context.get('provider_id') or '')) or {}
+        return self.public_tools.definitions(selected, provider_id=provider.get('id', ''),
+                                             model=str(context.get('model') or provider.get('model') or ''))
+
+    async def call_model_tool(self, name: str, arguments: dict, *, consumer_plugin: str = '', context: dict | None = None):
+        context = context or {}
+        provider = self._provider(str(context.get('provider_id') or '')) or {}
+        return await self.public_tools.call(name, arguments, provider_id=provider.get('id', ''),
+                                            model=str(context.get('model') or provider.get('model') or ''))
+
+    async def create_public_tool(
+        self, requirement: str, *, consumer_plugin: str = '', provider_id: str = '', model: str = '',
+        tool_id: str = '', provider_ids: list[str] | None = None, models: list[str] | None = None,
+    ) -> dict:
+        """Let a plugin ask AI to author and persist a new public Agent tool.
+
+        Returns the saved tool with id/function_name/origin. Generation never runs
+        code, publishes private registrations, enables tools or overwrites an ID.
+        Omitted tool_id allows automatic suffixes when the generated ID is taken.
+        """
+        if not isinstance(requirement, str) or not requirement.strip():
+            raise ValueError('请描述需要创建的工具')
+        if not isinstance(consumer_plugin, str) or len(consumer_plugin.strip()) > 128:
+            raise ValueError('consumer_plugin 应为不超过 128 字符的插件名')
+        consumer_plugin = consumer_plugin.strip()
+        for label, value in (('provider_ids', provider_ids), ('models', models)):
+            if value is not None and (not isinstance(value, list) or any(not isinstance(item, str) for item in value)):
+                raise ValueError(f'{label} 必须是字符串数组')
+        if tool_id:
+            tool_id = await asyncio.to_thread(self.public_tools.require_available_id, tool_id)
+        result = await self.complete(
+            [{'role': 'user', 'content': str(requirement)[:12000]}], provider_id=provider_id, model=model,
+            system_prompt=(
+                '你是 AI LLM 服务的 Python 工具作者。根据需求输出一个 JSON 对象，不要 Markdown。'
+                '字段：id（字母开头，仅字母数字下划线，最长48字符），name，description，'
+                'parameters（OpenAI object JSON Schema），code（完整 Python 源码字符串），'
+                'config（默认配置对象），timeout（1到120秒）。'
+                '源码必须定义 run(arguments, config)，允许 async def。只使用 Python 标准库。'
+                '函数返回可 JSON 序列化的结果，不读取机器人平台、环境变量或模型接口密钥。'
+                '不要捏造 API Key；需要的外部凭据通过 config 参数配置。'
+                '保持用途明确，不创建后台进程、自动安装依赖或无限循环。'
+            ), max_tokens=6000, temperature=0.2, prepare_context=False,
+            enable_public_tools=False, include_plugin_tools=False, enable_runtime_tools=False,
+            consumer_plugin=consumer_plugin or 'ai_llm_tool_author',
+        )
+        raw = str(result.get('text') or '').strip()
+        if raw.startswith('```'):
+            raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw)
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ValueError('AI 未返回有效工具 JSON，请重试或手动编辑') from error
+        if not isinstance(item, dict):
+            raise ValueError('AI 返回的工具必须是 JSON 对象')
+        if tool_id:
+            item['id'] = tool_id
+        item['enabled'] = False
+        item['provider_ids'] = provider_ids or []
+        item['models'] = models or []
+        item['origin'] = {
+            'kind': 'ai', 'plugin': consumer_plugin,
+            'provider_id': str(result.get('provider_id') or provider_id),
+            'model': str(result.get('model') or model), 'created_at': int(time.time()),
+        }
+        saved = await asyncio.to_thread(self.public_tools.save_generated, item, fixed_id=bool(tool_id))
+        return {**saved, 'key': saved['id'], 'function_name': 'tool_' + saved['id']}
 
 
     def config(self, *, public: bool = False, section: str = '') -> dict:
@@ -832,7 +930,7 @@ class AIService:
                 server['headers'] = {key: '********' for key in headers}
             if fields is None:
                 result['runtime_status'] = self.runtime.status()
-                result['plugin_tools'] = self.tool_registry.snapshot()
+                result['public_tools'] = self.public_tools.catalog()
             elif section == 'overview':
                 result['runtime_status'] = self.runtime.status(details=False)
         return result
@@ -1502,6 +1600,7 @@ class AIService:
         session_id: str = '',
         runtime_prompt: str = '',
         enable_runtime_tools: bool = False,
+        enable_public_tools: bool = False,
         consumer_plugin: str = '',
         runtime_capabilities: list[str] | None = None,
         required_tools: list[str] | None = None,
@@ -1521,6 +1620,7 @@ class AIService:
             'provider_id': provider_id, 'model': model, 'temperature': temperature,
             'max_tokens': max_tokens, 'tools': tools or [],
             'enable_runtime_tools': enable_runtime_tools, 'runtime_capabilities': runtime_capabilities or [],
+            'enable_public_tools': bool(enable_public_tools),
             'required_tools': required_tools or [],
             'prepare_context': bool(prepare_context),
         })
@@ -1564,6 +1664,18 @@ class AIService:
                     all_tools.append(item)
                     known.add(name)
 
+            base_tools = list(all_tools)
+            active_provider, active_model = candidates[0]
+            public_tool_names = set()
+
+            def public_definitions(provider, candidate_model):
+                definitions = self.public_tools.definitions(provider_id=provider['id'], model=candidate_model) if enable_public_tools else []
+                existing = {item['function']['name'] for item in base_tools}
+                definitions = [item for item in definitions if item['function']['name'] not in existing]
+                return [*base_tools, *definitions], {item['function']['name'] for item in definitions}
+
+            all_tools, public_tool_names = public_definitions(active_provider, active_model)
+
             runtime_tool_names = {item['function']['name'] for item in runtime_tools}
 
             async def dispatch_tool(name: str, arguments: dict):
@@ -1577,6 +1689,8 @@ class AIService:
                     return {'ok': True} if value is None else value
                 if name in runtime_tool_names:
                     return await self.runtime.call_tool(name, arguments)
+                if name in public_tool_names:
+                    return await self.public_tools.call(name, arguments, provider_id=active_provider['id'], model=active_model)
                 return {'ok': False, 'error': '工具未在本次请求中启用'}
 
             async def combined_handler(name: str, arguments: dict):
@@ -1661,6 +1775,8 @@ class AIService:
             last_error = None
             for provider, candidate_model in candidates:
                 try:
+                    active_provider, active_model = provider, candidate_model
+                    all_tools, public_tool_names = public_definitions(provider, candidate_model)
                     result = await self._complete_candidate(
                         provider, candidate_model, prepared_messages, combined_prompt,
                         temperature, max_tokens, all_tools or None,
@@ -1700,6 +1816,7 @@ class AIService:
     async def run_agent(self, messages: list[dict], **kwargs) -> dict:
         """启用中央运行能力并执行 Agent。"""
         kwargs['enable_runtime_tools'] = True
+        kwargs.setdefault('enable_public_tools', True)
         return await self.complete(messages, **kwargs)
 
 
