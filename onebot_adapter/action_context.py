@@ -24,8 +24,8 @@ class ActionContext:
     """Action 执行上下文 — 封装所有 Action 可能需要的服务依赖"""
 
     log: Any  # 日志器 (来自框架, 接口不透明)
-    senders: dict[int, MessageSender] = field(default_factory=dict)  # {appid: sender}
-    log_services: dict[int, LogService] = field(default_factory=dict)  # {appid: LogService}
+    senders: dict[str, MessageSender] = field(default_factory=dict)  # {appid: sender}
+    log_services: dict[str, LogService] = field(default_factory=dict)  # {appid: LogService}
     id_mapper: IDMapper | None = None
     qq_map: dict[str, int] = field(default_factory=dict)  # {appid_str: robot_qq_int}
     default_qq: int = 0

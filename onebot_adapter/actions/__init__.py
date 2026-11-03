@@ -7,6 +7,7 @@
   - DeleteMessageAction: delete_msg
   - GetLoginInfoAction: get_login_info
   - GetGroupInfoAction: get_group_info
+  - GetGroupMessageHistoryAction: get_group_msg_history
   - GetGroupListAction: get_group_list
   - GetFriendListAction: get_friend_list
   - GetStrangerInfoAction: get_stranger_info
@@ -32,6 +33,9 @@ from modules.onebot_adapter.actions.get_group_member_info import (
 from modules.onebot_adapter.actions.get_group_member_list import (
     GetGroupMemberListAction,
 )
+from modules.onebot_adapter.actions.get_group_msg_history import (
+    GetGroupMessageHistoryAction,
+)
 from modules.onebot_adapter.actions.get_login_info import GetLoginInfoAction
 from modules.onebot_adapter.actions.get_status import GetStatusAction
 from modules.onebot_adapter.actions.get_stranger_info import GetStrangerInfoAction
@@ -46,6 +50,7 @@ __all__ = [
     'DeleteMessageAction',
     'GetFriendListAction',
     'GetGroupInfoAction',
+    'GetGroupMessageHistoryAction',
     'GetGroupListAction',
     'GetGroupMemberInfoAction',
     'GetGroupMemberListAction',
