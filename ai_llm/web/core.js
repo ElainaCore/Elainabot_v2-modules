@@ -2,8 +2,6 @@ export const BASE = '/api/ext/ai-service';
 export const $ = id => document.getElementById(id);
 export let state = {};
 export let skills = [];
-export let modelTools = [];
-export let modelToolMarket = [];
 try {
   const theme = window.parent !== window && window.parent.ElainaWebPanelTheme;
   if (theme) theme.bind(document.documentElement, {variables: [], schemeAttributes: ['data-theme'], map: {
@@ -50,8 +48,6 @@ export async function streamApi(path, body, onEvent) {
 }
 export function setState(value) { state = {...state, ...(value || {})}; return state; }
 export function setSkills(value) { skills = Array.isArray(value) ? value : []; }
-export function setModelTools(value) { modelTools = Array.isArray(value) ? value : []; }
-export function setModelToolMarket(value) { modelToolMarket = Array.isArray(value) ? value : []; }
 export function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 export function toast(message, error = false) {
   const node = $('toast'); node.textContent = message; node.className = 'toast show' + (error ? ' error' : '');
@@ -71,35 +67,9 @@ export function providerOptions(current = '', allowAuto = false) {
 function field(key, value, type = 'text') {
   return '<input data-key="' + key + '" type="' + type + '" value="' + esc(value) + '">';
 }
-function modelToolCard(item) {
-  const permission = (state.model_tool_permissions || {})[item.id] === 'owner' ? 'owner' : 'all';
-  const folderTag = item.kind === 'folder' ? '<span>文件夹</span>' : '';
-  return '<article class="model-tool-card"><div class="model-tool-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '暂无简介') + '</small><div class="model-tool-meta"><code>' + esc(item.id) + '</code>' + folderTag + '</div><label class="model-tool-permission"><span>调用权限</span><select data-model-tool-permission="' + esc(item.id) + '"><option value="all"' + (permission === 'all' ? ' selected' : '') + '>所有人</option><option value="owner"' + (permission === 'owner' ? ' selected' : '') + '>仅主人</option></select></label></div><button class="btn danger delete-model-tool" data-tool-id="' + esc(item.id) + '" type="button">删除</button></article>';
-}
-function marketModelToolCard(item) {
-  const installed = !!item.installed;
-  const folderTag = item.type === 'folder' ? '<span>文件夹</span>' : '';
-  return '<article class="model-tool-card"><div class="model-tool-card-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '暂无简介') + '</small><div class="model-tool-meta"><code>' + esc(item.id) + '</code><span>v' + esc(item.version || '-') + '</span>' + folderTag + '</div></div><button class="btn '+ (installed ? '' : 'primary') + ' install-model-tool" data-tool-id="' + esc(item.id) + '" type="button" '+ (installed ? 'disabled' : '') + '>' + (installed ? '已安装' : '下载') + '</button></article>';
-}
 export function mcpTemplate(item) {
   const headers = JSON.stringify(item.headers || {}, null, 2);
   return '<article class="item" data-id="' + esc(item.id) + '"><div class="item-head"><strong>' + esc(item.name || 'MCP Server') + '</strong><button class="btn danger remove-item" type="button">删除</button></div><div class="item-body"><div class="grid"><div class="field"><label>ID</label>' + field('id', item.id) + '</div><div class="field"><label>名称</label>' + field('name', item.name) + '</div><div class="field"><label>Streamable HTTP 地址</label>' + field('endpoint', item.endpoint || '') + '</div><div class="field"><label>超时（秒）</label>' + field('timeout', item.timeout || 20, 'number') + '</div><div class="field"><label>请求头（JSON）</label><textarea data-key="headers" data-headers-set="' + (item.headers_set ? '1' : '0') + '">' + esc(headers) + '</textarea></div></div><label class="switch compact" style="margin-top:12px"><span><b>启用服务</b></span><input data-key="enabled" type="checkbox" ' + (item.enabled ? 'checked' : '') + '></label></div></article>';
-}
-export function capabilityTemplate(item) {
-  const status = item.online ? '在线' : '离线';
-  return '<article class="item capability-item collapsed" data-key="' + esc(item.key) + '"><button class="capability-row" type="button" aria-expanded="false"><span class="capability-main"><strong>' + esc(item.name || item.id) + '</strong><small>' + esc(item.description || '无描述') + '</small></span><span class="capability-tags"><i>' + esc(item.kind) + '</i><i>来源 ' + esc(item.source_plugin) + '</i><i class="' + (item.online ? 'online' : 'offline') + '">' + status + '</i><b>⌄</b></span></button><div class="item-body capability-body"><div class="switches two"><label class="switch compact"><span><b>启用能力</b><small>关闭后任何插件都不能调用</small></span><input data-key="enabled" type="checkbox" ' + (item.enabled ? 'checked' : '') + '></label><label class="switch compact"><span><b>允许其他插件使用</b><small>开启后其他插件可通过中央模块发现并调用</small></span><input data-key="shared" type="checkbox" ' + (item.shared ? 'checked' : '') + '></label></div><div class="field" style="margin-top:12px"><label>能力内容 / Prompt / Skill 指令</label><textarea data-key="content">' + esc(item.content || '') + '</textarea></div></div></article>';
-}
-export function readPluginCapabilities() {
-  return [...document.querySelectorAll('.plugin-capability-list .capability-item')].map(card => {
-    const value = {key: card.dataset.key};
-    value.enabled = card.querySelector('[data-key="enabled"]').checked;
-    value.shared = card.querySelector('[data-key="shared"]').checked;
-    value.content = card.querySelector('[data-key="content"]').value;
-    return value;
-  });
-}
-export function cronTemplate(item) {
-  return '<article class="item" data-id="' + esc(item.id) + '"><div class="item-head"><strong>' + esc(item.name || '计划任务') + '</strong><button class="btn danger remove-item" type="button">删除</button></div><div class="item-body"><div class="grid"><div class="field"><label>ID</label>' + field('id', item.id) + '</div><div class="field"><label>名称</label>' + field('name', item.name) + '</div><div class="field"><label>Cron（五段）</label>' + field('cron', item.cron || '') + '</div><div class="field"><label>间隔秒数</label>' + field('interval_seconds', item.interval_seconds || 0, 'number') + '</div><div class="field"><label>接口</label><select data-key="provider_id">' + providerOptions(item.provider_id, true) + '</select></div><div class="field"><label>模型</label>' + field('model', item.model || '') + '</div></div><div class="field" style="margin-top:12px"><label>任务 Prompt</label><textarea data-key="prompt">' + esc(item.prompt || '') + '</textarea></div><label class="switch compact" style="margin-top:12px"><span><b>启用任务</b></span><input data-key="enabled" type="checkbox" ' + (item.enabled ? 'checked' : '') + '></label></div></article>';
 }
 export function readItems(selector) {
   return [...document.querySelectorAll(selector)].map(card => {
@@ -110,41 +80,23 @@ export function readItems(selector) {
         try { value = JSON.parse(value || '{}'); } catch (_) { value = {}; }
         if (input.dataset.headersSet === '1') item.headers_set = true;
       }
-      if (['priority', 'timeout', 'interval_seconds'].includes(input.dataset.key)) value = Number(value);
+      if (['priority', 'timeout'].includes(input.dataset.key)) value = Number(value);
       item[input.dataset.key] = value;
     });
     return item;
   });
 }
-export function readModelToolPermissions() {
-  const permissions = {...(state.model_tool_permissions || {})};
-  document.querySelectorAll('[data-model-tool-permission]').forEach(select => {
-    permissions[select.dataset.modelToolPermission] = select.value === 'owner' ? 'owner' : 'all';
-  });
-  return permissions;
-}
 export function sectionPayload(section) {
-  if (section === 'overview') return {enabled: $('enabled').checked, model_tools_enabled: $('model_tools_enabled').checked, auto_switch: $('auto_switch').checked, auto_fetch_models: $('auto_fetch_models').checked, audit_include_content: $('audit_include_content').checked, temperature: Number($('temperature').value), max_tokens: Number($('max_tokens').value), max_tool_rounds: Number($('max_tool_rounds').value), request_timeout: Number($('request_timeout').value)};
+  if (section === 'overview') return {enabled: $('enabled').checked, auto_switch: $('auto_switch').checked, auto_fetch_models: $('auto_fetch_models').checked, audit_include_content: $('audit_include_content').checked, temperature: Number($('temperature').value), max_tokens: Number($('max_tokens').value), max_tool_rounds: Number($('max_tool_rounds').value), request_timeout: Number($('request_timeout').value)};
   if (section === 'context') return {runtime_prompt: $('runtime_prompt').value, context: {max_tokens: Number($('context_max_tokens').value), max_turns: Number($('context_max_turns').value), keep_recent_ratio: Number($('context_keep_ratio').value), compress_enabled: $('context_compress').checked}};
   if (section === 'skills') return {skills: {enabled: $('skills_enabled').checked, enabled_ids: [...document.querySelectorAll('[data-skill-id]:checked')].map(node => node.dataset.skillId)}};
   if (section === 'mcp') return {mcp: {enabled: $('mcp_enabled').checked, servers: readItems('#mcp-list .item')}};
-  if (section === 'cron') return {cron_jobs: readItems('#cron-list .item')};
-  if (section === 'model-tools') return {model_tool_permissions: readModelToolPermissions()};
   return {};
-}
-function renderCapabilities(kind, id) {
-  const items = (state.plugin_capabilities || []).filter(item => item.kind === kind);
-  $(id).innerHTML = items.map(capabilityTemplate).join('') || '<div class="empty">尚无插件注册此类能力</div>';
-  $(id).querySelectorAll('.capability-row').forEach(button => button.onclick = () => {
-    const card = button.closest('.capability-item');
-    const expanded = !card.classList.toggle('collapsed');
-    button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
-  });
 }
 
 export function renderCommon(page = 'overview') {
   if (page === 'overview') {
-    ['enabled', 'model_tools_enabled', 'auto_switch', 'auto_fetch_models', 'audit_include_content'].forEach(key => $(key).checked = !!state[key]);
+    ['enabled', 'auto_switch', 'auto_fetch_models', 'audit_include_content'].forEach(key => $(key).checked = !!state[key]);
     ['temperature', 'max_tokens', 'max_tool_rounds', 'request_timeout'].forEach(key => $(key).value = state[key] ?? '');
   }
   if (page === 'overview') {
@@ -161,21 +113,9 @@ export function renderCommon(page = 'overview') {
   } else if (page === 'skills') {
     $('skills_enabled').checked = !!state.skills?.enabled;
     $('skill-list').innerHTML = skills.length ? skills.map(item => '<article class="skill"><input type="checkbox" data-skill-id="' + esc(item.id) + '" ' + ((state.skills?.enabled_ids || []).includes(item.id) ? 'checked' : '') + '><span><b>' + esc(item.name) + '</b><small>' + esc(item.description) + '</small><code>' + esc(item.id) + '</code></span><button class="btn danger delete-skill" data-delete-skill="' + esc(item.id) + '" type="button">删除</button></article>').join('') : '<div class="empty">暂无 Skill，可上传 SKILL.md 或 Skill 压缩包</div>';
-    renderCapabilities('skill', 'plugin-skill-list');
-  } else if (page === 'tools') {
-    renderCapabilities('tool', 'plugin-tool-list');
   } else if (page === 'mcp') {
     $('mcp_enabled').checked = !!state.mcp?.enabled;
     $('mcp-list').innerHTML = (state.mcp?.servers || []).map(mcpTemplate).join('') || '<div class="empty">尚未配置 MCP Server</div>';
-    renderCapabilities('mcp', 'plugin-mcp-list');
-  } else if (page === 'cron') {
-    const panelJobs = (state.cron_jobs || []).filter(item => item.source !== 'model_tool');
-    $('cron-list').innerHTML = panelJobs.map(cronTemplate).join('') || '<div class="empty">尚未配置计划任务</div>';
-  } else if (page === 'model-tools') {
-    $('model-tool-list').innerHTML = modelTools.map(modelToolCard).join('') || '<div class="empty">尚未安装模型工具</div>';
-    $('model-tool-market-list').innerHTML = modelToolMarket.map(marketModelToolCard).join('') || '<div class="empty">市场清单为空或暂时无法获取</div>';
-  } else if (page === 'agents') {
-    renderCapabilities('agent', 'plugin-agent-list');
   } else if (page === 'test') {
     $('test-provider').innerHTML = providerOptions(state.active_provider);
     $('test-provider').value = state.active_provider || '';

@@ -70,6 +70,7 @@ if ctx:
 | `send_private_msg` | `user_id`、`message` | `data.message_id` |
 | `delete_msg` | `message_id` | 当前实现依赖消息 ID，失败会返回 `retcode=1` |
 | `get_login_info` | 无 | `user_id`、`nickname` |
+| `get_group_info` | `group_id` | 实时群名称、当前成员数和成员上限 |
 | `get_group_msg_history` | `group_id`、可选 `self_id`、`count`、`message_seq` | 本地日志中的群消息，返回 `data.messages`；每条消息包含发送者 `openid` 与 `raw_json` 原始载荷，`message_seq` 为包含锚点的向前翻页游标 |
 | `get_group_list` | 无 | 已缓存群列表 |
 | `get_friend_list` | 无 | 已缓存用户列表 |
@@ -84,7 +85,7 @@ if ctx:
 
 ### 消息参数
 
-`message` 支持纯文本和 OneBot 消息段数组。常用段包括 `text`、`image`、`record`、`video`、`file`、`markdown`、`reply`、`at`、`face` 和 `keyboard`。图片、语音、视频、文件段可使用 `file`、`url` 或 `data`，具体可用字段取决于下游发送器和平台权限。
+`message` 支持纯文本和 OneBot 消息段数组。常用段包括 `text`、`image`、`record`、`video`、`file`、`markdown`、`ark`、`reply`、`at`、`face` 和 `keyboard`。图片、语音、视频、文件段可使用 `file`、`url` 或 `data`，具体可用字段取决于下游发送器和平台权限。
 
 ```json
 {
@@ -95,6 +96,24 @@ if ctx:
       {"type": "text", "data": {"text": "今日图片："}},
       {"type": "image", "data": {"file": "https://example.com/a.png"}}
     ]
+  }
+}
+```
+
+Ark 段通过 `args` 和 `kwargs` 传入参数，语义与 core 的 `reply_ark(template_id, kv_data, content='')` 一致。模板 23、24、37 支持相同的简写数据：
+
+```json
+{
+  "action": "send_group_msg",
+  "params": {
+    "group_id": 123456,
+    "message": {
+      "type": "ark",
+      "data": {
+        "args": [23, ["列表卡片标题", "提示文本", [["项目1"], ["项目2", "https://example.com"]]]],
+        "kwargs": {"content": ""}
+      }
+    }
   }
 }
 ```

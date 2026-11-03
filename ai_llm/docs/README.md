@@ -1,253 +1,236 @@
 # AI LLM
 
-AI LLM 是 ElainaBot 的统一大模型服务模块。接口密钥、模型、优先级和模型能力由模块集中管理，业务插件只负责提交消息和处理自己的业务逻辑。
+ElainaBot 的统一模型服务。集中管理接口、密钥、模型目录、优先级、请求执行和工具调用。业务插件管理自己的配置、消息路由、人格、会话、记忆和调度。
 
-## 优点
+## 能力
 
-- **统一管理接口**：集中配置 OpenAI、OpenAI 兼容中转、Gemini、Grok、Agnes、NovelAI、Jimeng2API、Z-Image Gitee 等接口和 API Key。
-- **自动获取模型**：可从接口同步模型列表，并保留已有模型的启用状态与优先级。
-- **双层优先级**：同时支持接口优先级和接口内模型优先级。
-- **自动故障切换**：当前模型或整个接口不可用时，可按优先级尝试下一个候选。
-- **流式响应**：支持 SSE 增量输出，适合聊天、开发助手和实时生成场景。
-- **统一模型运行时**：支持工具调用、多轮工具执行、模型工具、运行时 Prompt 和中断。
-- **Skills 与 MCP**：支持从面板上传、启用和删除 Skills，并支持公网 HTTPS MCP 工具发现与调用。
-- **插件能力注入**：插件可以注册自己的 Skill、Agent、MCP 和工具，供模型运行时或其他插件调用。
-- **上下文控制**：支持会话标识、上下文裁剪和 Token 预算控制。
-- **调用可观测性**：统一记录模型、Token、首字延迟、总耗时、故障切换和工具调用。
-- **安全保护**：公开配置会隐藏 API Key；MCP 拒绝回环、内网、链路本地和云元数据地址。
+- OpenAI Chat Completions、Responses、兼容中转、Gemini 原生等协议适配。
+- 模型获取与测活、接口和模型优先级、故障切换、流式响应。
+- 文本和多模态消息输入、生图接口、审核接口。
+- 调用级工具与插件私有工具注册；完整保留 JSON Schema，支持同步函数、异步函数、实例绑定方法。
+- 工具执行轮数、超时、必要工具校验、按运行或会话 ID 中断。
+- 可选的中央 Skills 和公网 HTTPS MCP 工具发现与调用。
+- 调用日志、Token 用量、延迟和故障切换记录。
+- 可选的无状态上下文预算控制；只处理本次传入的消息，不保存历史。
 
-## 启用模块
+## 启用
 
-1. 将 `ai_llm` 放入 ElainaBot 的模块目录。
-2. 在框架的模块管理中启用 **AI LLM**。
-3. 打开 AI LLM Web 面板，选择接口类型并填写 Base URL、API Key 与模型。
-4. 获取模型，启用需要使用的模型并调整接口、模型优先级。
-5. 启用 **LLM 服务**；需要工具调用时同时启用 **模型工具**。
-
-旧版接口配置会自动按“OpenAI 兼容 / 中转”读取。Gemini 原生类型会转换消息、工具调用和模型列表；其他 OpenAI 兼容类型可在面板覆盖模型、对话和生图路径。NovelAI 生图使用其原生请求与 ZIP 图片响应。Skills 页面支持上传 UTF-8 `SKILL.md` 或包含单个 `SKILL.md` 的 ZIP，单个上传文件最大 5 MB。
-
-模型工具市场支持上传不超过 512 KB 的单文件 `.py` 工具，或不超过 20 MB、根目录包含 `tool.py` 的文件夹 ZIP；也可以从 `Elaina-plugins/tools.json` 清单安装。入口必须声明静态 `TOOL` 字典和 `run(arguments, context)` 函数。
-
-插件不应自行保存大模型接口或密钥。需要让用户选择接口、模型时，应从 `service.config(public=True)` 返回的公开配置中生成选项。
-
-## 获取服务
+1. 安装并启用 `ai_llm` 模块。
+2. 在模块面板配置接口、API Key、模型与优先级。
+3. 业务插件从公开配置中选择 `provider_id` 和 `model`，不重复保存接口密钥。
 
 ```python
 from modules.ai_llm import get_service
-
 
 service = get_service()
-if service is None:
-    raise RuntimeError('请前往插件市场下载并启用 AI LLM 模块')
-```
+if service is None or not service.available():
+    raise RuntimeError('请安装、启用并配置 AI LLM 模块')
 
-建议插件在实际调用前获取服务，不要在模块导入阶段永久缓存 `None`。这样 AI LLM 重载后，插件可以重新取得当前服务实例。
-
-## 基础对话
-
-```python
-from modules.ai_llm import get_service
-
-
-async def ask_ai(text: str, user_id: str) -> str:
-    service = get_service()
-    if service is None:
-        raise RuntimeError('请前往插件市场下载并启用 AI LLM 模块')
-
-    result = await service.complete(
-        messages=[{'role': 'user', 'content': text}],
-        system_prompt='你是一个简洁、可靠的助手。',
-        session_id=f'my_plugin:{user_id}',
-        consumer_plugin='my_plugin',
-    )
-    return result['text']
-```
-
-未指定接口和模型时，模块会按照面板中的接口优先级与模型优先级自动选择，并在失败时执行故障切换。
-
-## 选择接口和模型
-
-插件可以提供“自动选择”以及指定接口、模型的选项，但选项必须来自中央模块：
-
-```python
-config = service.config(public=True)
-providers = config.get('providers', [])
-
-result = await service.run_agent(
+result = await service.complete(
     messages=[{'role': 'user', 'content': '你好'}],
-    provider_id='provider-id',  # 留空时自动选择接口
-    model='model-name',         # 留空时按模型优先级选择
+    system_prompt='请简洁回答。',
     consumer_plugin='my_plugin',
+    session_id='my_plugin:user-1',
+    prepare_context=False,  # 业务插件已管理历史时关闭中央裁剪
 )
+text = result['text']
 ```
 
-- `provider_id` 和 `model` 都为空：使用中央自动策略。
-- 只指定 `provider_id`：在该接口内按模型优先级选择和切换。
-- 同时指定两者：优先使用指定组合；该模型失败时不会擅自改成其他指定模型。
+`session_id` 用于运行标识、中断和日志关联；不会自动加载或保存聊天历史。不同业务与用户应使用不同 ID。默认情况下，同一 ID 的新调用会中断仍在运行的旧调用。
 
-## 流式输出
+## 工具调用
 
-```python
-async def stream_reply(messages):
-    service = get_service()
-    if service is None:
-        raise RuntimeError('请前往插件市场下载并启用 AI LLM 模块')
-
-    async for event in service.stream_complete(
-        messages=messages,
-        session_id='my_plugin:conversation-1',
-    ):
-        if event.get('type') == 'delta':
-            yield event.get('text', '')
-        elif event.get('type') == 'done':
-            usage = event.get('usage', {})
-```
-
-`delta` 到达后应立即转发给前端或聊天平台，不要等待整个生成过程结束。
-
-## 接入插件工具
-
-工具定义使用 OpenAI Chat Completions 格式，工具处理器可以是同步或异步函数：
+调用级工具随本次请求提供：
 
 ```python
-TOOLS = [{
+tools = [{
     'type': 'function',
     'function': {
-        'name': 'get_plugin_status',
-        'description': '读取当前插件状态',
+        'name': 'query_status',
+        'description': '查询当前状态',
         'parameters': {
-            'type': 'object',
-            'properties': {},
-            'additionalProperties': False,
+            'type': 'object', 'properties': {}, 'additionalProperties': False,
         },
     },
 }]
 
-
-async def run_tool(name: str, arguments: dict):
-    if name == 'get_plugin_status':
+async def handle_tool(name, arguments):
+    if name == 'query_status':
         return {'enabled': True}
     return {'ok': False, 'error': '未知工具'}
 
-
 result = await service.complete(
-    messages=[{'role': 'user', 'content': '检查插件状态'}],
-    tools=TOOLS,
-    tool_handler=run_tool,
-    max_tool_rounds=4,
+    messages=[{'role': 'user', 'content': '现在状态如何？'}],
+    tools=tools,
+    tool_handler=handle_tool,
     consumer_plugin='my_plugin',
+    max_tool_rounds=3,
+    tool_timeout=30,
 )
 ```
 
-插件必须自行完成工具权限检查、参数校验和结果过滤。模型声称调用了工具不代表工具已经执行，业务结果应以 `tool_handler` 的真实返回值为准。
-
-## 使用中央 Agent 能力
-
-需要中央 Skills、Agent、MCP 或插件共享工具时，传入插件身份和允许使用的能力类型：
+跨请求使用的工具可以注册到该服务实例：
 
 ```python
+service.register_plugin_tools('my_plugin', tools, handle_tool)
 result = await service.complete(
+    messages=[{'role': 'user', 'content': '查询状态'}],
+    consumer_plugin='my_plugin',
+)
+# 插件卸载时注销；中央服务重载后需要重新注册。
+service.unregister_plugin_tools('my_plugin')
+```
+
+- 插件注册的私有工具只会注入相同 `consumer_plugin` 的请求，不上报公用工具目录或面板；每个服务实例独立管理。
+- 直接传入绑定方法作为 `handler` 即可，无需继承中央插件基类。
+- 同名调用级工具优先于注册工具；模型只能执行本次请求中公开的工具。
+- `include_plugin_tools=False` 可关闭注册工具注入。
+- `execute_tools=False` 只生成并返回 `tool_calls`，不会执行工具。
+- `tool_timeout` 默认 120 秒；超时终止本次调用，不触发模型故障切换重复执行工具。同步处理器应保持快速，耗时工作需提供可取消的异步处理器。
+- `result['tool_events']` 包含真实工具调用的名称、ID、参数和结果。
+
+## 公用 Agent 工具
+
+面板「Agent 工具」独立管理中央公用库：
+
+- **下载**：选择内置的当前时间、文本统计工具，或填写工具 JSON 的公网 HTTPS 直接下载地址。也可导入本地 JSON。
+- **配置**：编辑名称、用途说明、参数 Schema、Python 代码和本地配置，可限制适用接口及模型名称。
+- **AI 创作**：选择已有模型，描述需求，服务调用模型生成代码并自动保存；生成过程不执行工具，也不注入现有公用或私有工具。
+- **启停与试运行**：新下载、导入和 AI 创建的工具默认停用。保存后可使用参数 JSON 试运行，再决定是否启用。
+- **分享**：导出 JSON 会清空本地配置并关闭启用状态，避免将配置中的凭据一起分享。导入或下载也会清空来源包配置。
+
+工具保存在模块数据目录的 `public_tools/<id>.json`，重启后继续加载。ID 不可修改；手动新建不会覆盖同名工具，AI 未指定 ID 时自动为同名结果追加后缀。读取失败的文件会在面板列出，其他工具仍可用。
+
+### 插件请求 AI 创建公用工具
+
+插件直接调用 `service.create_public_tool()` 即可，无需注册私有工具、上报回调函数或调用 Web 面板：
+
+```python
+from modules.ai_llm import get_service
+
+async def create_shared_date_tool():
+    service = get_service()
+    if service is None or not service.available():
+        raise RuntimeError('请先安装、启用并配置 AI LLM 服务')
+
+    tool = await service.create_public_tool(
+        '制作日期差工具：输入 YYYY-MM-DD 日期，返回它与今天相差的天数，过去为负、未来为正。',
+        consumer_plugin='my_plugin',  # 创建来源与模型调用日志归属
+        tool_id='date_distance',      # 可选：指定新工具 ID，已存在时明确报错
+        provider_id='', model='',     # 可选：创作接口和模型；留空按中央优先级选择
+    )
+    return {
+        'id': tool['id'],
+        'function_name': tool['function_name'],  # tool_date_distance
+        'enabled': tool['enabled'],             # False，尚未执行或自动启用
+    }
+```
+
+生成结果会立即写入中央 `public_tools/` 并显示在「Agent 工具」页，面板标记“AI 创建 · 插件：my_plugin”。启用后，其他插件可以通过 `model_tool_definitions([tool['id']])` 和 `call_model_tool()` 选择、调用它；发起插件的私有工具仍不会进入公用库。
+
+- `consumer_plugin`：发起插件名称，用于来源记录与调用日志，不会因此注入该插件的私有工具。
+- `tool_id`：可选，指定时不覆盖已存在的 ID；未指定时使用 AI 生成的 ID，同名自动添加 `_2`、`_3` 等后缀，多插件并发创建也不会覆盖。
+- `provider_id`、`model`：仅决定使用哪个模型创作工具。
+- `provider_ids`、`models`：可选字符串数组，限制成品工具适用的接口和模型；默认不限，与创作模型选择独立。
+- 返回值是已保存的完整工具定义，额外含 `key`、`function_name`；`origin` 记录创建插件、实际创作接口/模型和时间，重启及编辑后仍保留。
+- 代码和 Schema 校验失败时抛出 `ValueError`；模型调用失败按 `complete()` 的错误约定抛出，已有工具不受影响。
+
+同一能力也可经已鉴权的 `POST /api/ext/ai-service/agent-tools/create` 调用，请求字段与上述参数一致，需求字段为 `requirement`。
+
+工具格式：
+
+```json
+{
+  "id": "echo",
+  "name": "回声",
+  "description": "返回输入文字",
+  "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+  "code": "def run(arguments, config):\n    return arguments[\"text\"]\n",
+  "config": {},
+  "enabled": false,
+  "timeout": 30,
+  "provider_ids": [],
+  "models": []
+}
+```
+
+`run(arguments, config)` 支持同步或异步函数，返回值必须可 JSON 序列化。参数按 JSON Schema 校验；Schema 支持内部引用，不加载远程引用。模块通过 `requirements.txt` 声明 `jsonschema` 依赖，框架启用模块时安装。
+
+每次执行使用独立 Python 进程，最多并行 4 个，超时 1–120 秒，输入和输出各限制 512KB；取消和卸载会清理运行进程。独立进程用于生命周期管理，**不是系统沙箱**，工具仍拥有机器人进程对应用户的文件和网络权限，只应启用可信代码。本地配置不会出现在工具目录或发送给模型的参数定义中；工具自身的返回值和错误仍会回填给模型，因此代码应避免返回敏感配置。
+
+`run_agent()` 默认注入已启用、适用于当前实际接口与模型的公用工具：
+
+```python
+result = await service.run_agent(messages=messages, consumer_plugin='my_plugin')
+# 普通 complete() 保持按需；显式启用公用工具：
+result = await service.complete(messages=messages, enable_public_tools=True)
+```
+
+业务插件也可以只选择所需公用工具。聊天陪伴的原有公用工具选择页已接通：
+
+```python
+definitions = service.model_tool_definitions(['echo'], context={'provider_id': 'my-provider', 'model': 'my-model'})
+result = await service.call_model_tool('tool_echo', {'text': '你好'}, context={'provider_id': 'my-provider', 'model': 'my-model'})
+```
+
+`model_tool_catalog()` 仅返回公用工具，绝不返回插件私有注册。公用工具的函数名统一为 `tool_<id>`；调用级工具和插件私有工具同名时优先使用它们。模型故障切换时重新筛选适用的公用工具。
+
+## Skills 与 MCP
+
+面板管理 Skills 和 MCP，但普通 `complete()` 不会自动注入它们。需要时使用：
+
+```python
+result = await service.run_agent(
     messages=[{'role': 'user', 'content': '完成这项任务'}],
     consumer_plugin='my_plugin',
-    runtime_capabilities=['skill', 'agent', 'mcp', 'tool'],
+    runtime_capabilities=['skill', 'mcp'],
 )
 ```
 
-`consumer_plugin` 用于能力发现、权限判断和调用日志归属。没有插件身份的请求不会加载插件注入能力。
+`run_agent()` 是启用中央运行工具的便捷入口；不管理插件生命周期、不创建平台消息、不定时运行。Skills 支持上传 UTF-8 `SKILL.md` 或包含单个 `SKILL.md` 的 ZIP。MCP 只接受公网 HTTPS 地址，受请求超时与网络地址检查限制。
 
-## 注册插件能力
-
-插件可以注册 `skill`、`agent`、`mcp` 或 `tool`。注册能力默认启用但仅供来源插件使用；管理员可显式共享给所有插件，也可通过 `allowed_consumers` 只授权指定插件。
-
-### 注册 Skill
+## 流式输出
 
 ```python
-service.register_plugin_capability('my_plugin', 'skill', {
-    'id': 'deployment-guide',
-    'name': '部署规范',
-    'description': '提供本插件的部署与检查流程。',
-    'content': '执行部署任务时需要遵守的完整说明。',
-})
+async for event in service.stream_complete(
+    messages=[{'role': 'user', 'content': '你好'}],
+    session_id='my_plugin:user-1',
+    prepare_context=False,
+):
+    if event.get('type') == 'delta':
+        yield event['text']
+    elif event.get('type') == 'done':
+        usage = event.get('usage', {})
 ```
 
-### 注册工具
+流式入口用于文本生成；工具执行使用 `complete()`。流式输出开始后不会切换到另一个模型重放正文。
 
-```python
-async def capability_handler(capability_id: str, arguments: dict):
-    if capability_id == 'query-status':
-        return {'ok': True, 'status': 'running'}
-    return {'ok': False, 'error': '不支持的能力'}
+## 职责精简与升级
 
+已移除中央人格/会话存储、Cron 调度、平台消息组件、兼容插件加载器、配置存储、命令/权限/事件占位装饰器及 `service.api` / `activate_plugin()`。模块不创建或接管 `astrbot` 命名空间，也不依赖 AstrBot。
 
-service.register_plugin_capability(
-    'my_plugin',
-    'tool',
-    {
-        'id': 'query-status',
-        'name': '查询状态',
-        'description': '查询插件的实时运行状态。',
-        'config': {
-            'schema': {
-                'type': 'object',
-                'properties': {},
-                'additionalProperties': False,
-            },
-        },
-    },
-    handler=capability_handler,
-)
+人格、上下文持久化、用户记忆和主动问候由聊天陪伴等业务插件负责；AstrBot 适配由独立的基座插件负责。原有 `complete()`、`stream_complete()`、`run_agent()` 和原生工具注册保留。
+
+旧 `persona`、`cron_jobs` 设置不再生效，保存新配置前会在数据目录归档为 `retired_features.json`，便于迁移；既有 `ai_service.db` 与 `plugin_configs` 文件不会删除或修改。旧计划任务不会继续运行。使用已移除接口的第三方插件需要迁移到原生调用，移除的关键字参数会明确报错。
+
+## 验证
+
+在模块仓库根目录运行：
+
+```text
+python -B -m unittest discover -s ai_llm/tests -v
+node ai_llm/tests/test_providers.cjs
+node ai_llm/tests/test_agent_tools.cjs
 ```
 
-### 注册 MCP
+测试不连接外部模型，覆盖参数保留、绑定方法、插件隔离、注册原子性、单轮生成、工具循环与超时、故障切换、流式输出、卸载取消及面板页面完整性。
 
-```python
-service.register_plugin_capability('my_plugin', 'mcp', {
-    'id': 'public-mcp',
-    'name': '插件 MCP',
-    'description': '由插件提供的公网 HTTPS MCP 服务。',
-    'config': {
-        'endpoint': 'https://example.com/mcp',
-        'headers': {'Authorization': 'Bearer ...'},
-        'timeout': 20,
-    },
-})
-```
+## 简化接口设置
 
-插件卸载或停止时，应将运行能力标记为离线：
+接口卡片和模型列表默认收起，进入接口页时重新收起。展开后只显示名称、类型、URL、API Key 和优先级；默认按模型优先级自动选择模型。
 
-```python
-service.unregister_plugin_capabilities('my_plugin')
-```
+模型列表、对话、生图和图片编辑路径由接口类型自动适配，例如 Responses 使用 `/responses`，Gemini 原生使用 `/models/{model}:generateContent`。高级设置中的路径留空表示自动；只有非标准服务需要自定义。获取模型失败时可以在高级设置中手动添加模型或指定模型。
 
-## 发现和调用能力
+进入接口页时会尝试查询兼容中转的额度余额，使用同一接口地址和 Key，不发送模型请求。成功结果缓存 5 分钟，不支持或无权限时隐藏余额并缓存 1 小时，避免反复查询；高级设置可关闭自动查询。该数值是服务商计费接口返回的额度余额，不保证等于网站钱包现金余额。
 
-```python
-capabilities = service.list_capabilities('my_plugin')
-mcp_capabilities = await service.discover_capabilities('my_plugin', 'mcp')
-
-result = await service.call_capability(
-    'my_plugin',
-    capability_key='source_plugin:tool:capability-id',
-    arguments={'key': 'value'},
-)
-```
-
-只能调用当前在线、已启用且允许该插件使用的能力。`capability_key` 应使用发现接口返回的值，不要由插件自行拼接。
-
-## 模型工具权限与定时提醒
-
-已安装的模型工具可以在面板中设置为“所有人可用”或“仅主人可用”。权限判断发生在程序的工具定义过滤和实际调用入口，读取真实消息 `Event` 的 `appid`、`user_id`，并与该机器人配置中的 `owner_ids` 比较；模型传入的用户 ID、群 ID 或权限声明不会参与授权。
-
-定时提醒由 `schedule_reminder` 模型工具创建。创建时必须来自真实消息，程序会绑定触发消息所在的群、私聊或频道，以及创建者身份；模型不能改写投递目标。支持 `delay_seconds`（10 秒至 1 年）、Unix `run_at`、`list` 和 `cancel`。任务执行一次后自动删除，每个机器人和用户最多保留 20 个待执行任务，全局最多 100 个任务。
-
-## 接入注意事项
-
-- 为每个对话传入稳定且隔离的 `session_id`，不要让不同用户共享上下文。
-- `complete()` 是纯模型入口，不会隐式加载中央运行时能力；需要 Agent 行为时使用 `run_agent()`。
-- 已经自行管理历史、摘要或记忆的插件应传入 `prepare_context=False`，避免中央层再次裁剪。
-- 为调用传入固定的 `consumer_plugin`，便于权限判断和日志定位。
-- 插件面板只保存 `provider_id`、`model` 等选择，不保存 API Key。
-- 不要把公开配置中的脱敏密钥当作真实密钥再次提交。
-- 网络工具必须拒绝回环、内网、链路本地和云元数据地址，避免泄露服务器 IP 与网络信息。
-- MCP 只应使用可信的公网 HTTPS 服务，并限制可调用工具和超时时间。
-- 在插件界面检测不到模块时，应灰化相关功能并提示用户前往插件市场下载 AI LLM。
+计费格式依据 [New API 账户计费面板文档](https://doc.newapi.pro/api/fei-account-billing-panel/)：`hard_limit_usd - total_usage / 100`。不要求填写管理员令牌，也不为不支持的接口推算余额。
