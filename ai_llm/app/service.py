@@ -447,11 +447,20 @@ def _responses_payload(payload: dict) -> dict:
         if message.get('content'):
             content = message['content']
             if isinstance(content, list):
-                content = [
-                    {'type': 'input_image', 'image_url': part['image_url']['url']} if part.get('type') == 'image_url'
-                    else {'type': 'output_text' if message['role'] == 'assistant' else 'input_text', 'text': part.get('text', '')}
-                    for part in content
-                ]
+                converted = []
+                for part in content:
+                    if part.get('type') == 'image_url':
+                        image = part['image_url']
+                        converted.append({
+                            'type': 'input_image', 'image_url': image['url'],
+                            'detail': image.get('detail', 'auto'),
+                        })
+                    else:
+                        converted.append({
+                            'type': 'output_text' if message['role'] == 'assistant' else 'input_text',
+                            'text': part.get('text', ''),
+                        })
+                content = converted
             items.append({'role': message['role'], 'content': content})
         for call in message.get('tool_calls') or []:
             items.append({'type': 'function_call', 'call_id': call['id'], **call['function']})
@@ -520,9 +529,22 @@ def _openai_to_gemini(payload: dict) -> dict:
                 response = {'result': response}
             contents.append({'role': 'user', 'parts': [{'functionResponse': {'name': name, 'response': response}}]})
             continue
-        text = _message_text(message.get('content'))
-        if text:
-            contents.append({'role': 'user', 'parts': [{'text': text}]})
+        parts = []
+        value = message.get('content')
+        if isinstance(value, list):
+            for part in value:
+                if part.get('type') == 'image_url':
+                    url = str((part.get('image_url') or {}).get('url') or '')
+                    match = re.fullmatch(r'data:(image/[\w.+-]+);base64,([A-Za-z0-9+/=\r\n]+)', url)
+                    if not match:
+                        raise AIProviderError('Gemini 原生图片输入需使用 base64 data URL')
+                    parts.append({'inlineData': {'mimeType': match[1], 'data': match[2]}})
+                elif part.get('type') in {'text', 'input_text'} and part.get('text'):
+                    parts.append({'text': str(part['text'])})
+        elif value:
+            parts.append({'text': str(value)})
+        if parts:
+            contents.append({'role': 'user', 'parts': parts})
     result = {
         'contents': contents or [{'role': 'user', 'parts': [{'text': ''}]}],
         'generationConfig': {

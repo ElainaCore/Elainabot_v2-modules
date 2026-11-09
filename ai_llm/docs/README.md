@@ -7,11 +7,14 @@ ElainaBot 的统一模型服务。集中管理接口、密钥、模型目录、�
 - OpenAI Chat Completions、Responses、兼容中转、Gemini 原生等协议适配。
 - 模型获取与测活、接口和模型优先级、故障切换、流式响应。
 - 文本和多模态消息输入、生图接口、审核接口。
+
 - 调用级工具与插件私有工具注册；完整保留 JSON Schema，支持同步函数、异步函数、实例绑定方法。
 - 工具执行轮数、超时、必要工具校验、按运行或会话 ID 中断。
 - 可选的中央 Skills 和公网 HTTPS MCP 工具发现与调用。
 - 调用日志、Token 用量、延迟和故障切换记录。
 - 可选的无状态上下文预算控制；只处理本次传入的消息，不保存历史。
+
+视觉输入沿用 OpenAI `content: [{type: "text", text: "..."}, {type: "image_url", image_url: {url: "..."}}]` 格式。Chat Completions 保留该结构，Responses 转换为 `input_image` 并保留 `detail`；Gemini 原生将 `data:image/...;base64,...` 转为 `inlineData`，远程图片请调用方先下载为 data URL。Gemini 不会静默丢弃不支持的远程图片输入。模型本身需支持视觉。
 
 ## 启用
 
