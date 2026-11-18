@@ -22,16 +22,19 @@
     playwright.yaml → max_pages / headless / idle_timeout / timeout 等
 """
 
-import contextlib
 import asyncio
+import contextlib
 import os
 import sys
+import tempfile
 from contextlib import asynccontextmanager
 
+import psutil
 from core.base.logger import EXTENSION, get_logger
 from modules.renderer.base import IdleEngine
 
 log = get_logger(EXTENSION, 'Playwright')
+_INSTALL_TIMEOUT = 300
 
 _DEFAULTS = {
     'headless': True,
@@ -93,10 +96,12 @@ class PlaywrightRenderer(IdleEngine):
         '_browser',
         '_last_error',
         '_lifecycle_lock',
-        '_browser_install_lock',
     )
 
     def __init__(self, cfg):
+        browser = cfg.get('browser_type', 'chromium')
+        if browser not in ('chromium', 'firefox', 'webkit'):
+            raise ValueError(f'无效的 Playwright 浏览器类型: {browser!r}')
         # 用完即关模式只允许一个页面，避免并发启动多个浏览器。
         max_pages = 1 if cfg.get('close_after_use', False) else cfg.get('max_pages', 2)
         super().__init__(cfg, max_pages)
@@ -104,8 +109,16 @@ class PlaywrightRenderer(IdleEngine):
         self._browser = None
         self._last_error = None
         self._lifecycle_lock = asyncio.Lock()
-        # Playwright 安装浏览器是进程级操作；锁可避免并发首次调用重复执行安装。
-        self._browser_install_lock = asyncio.Lock()
+
+    async def prepare_browser(self):
+        """由渲染模块在启用时补齐浏览器，实际浏览器进程仍按需启动。"""
+        if not self._cfg.get('auto_install_browser', True):
+            return
+        browser = self._cfg.get('browser_type', 'chromium')
+        with_deps = sys.platform.startswith('linux') and self._cfg.get('install_with_deps', False)
+        log.info(f'正在检查并补齐 Playwright {browser} 浏览器...')
+        await self._install_browser(browser, with_deps=with_deps)
+        log.info(f'Playwright {browser} 浏览器已就绪')
 
     async def close(self):
         async with self._lifecycle_lock:
@@ -159,16 +172,10 @@ class PlaywrightRenderer(IdleEngine):
             if not self._pw:
                 from playwright.async_api import async_playwright
                 self._pw = await async_playwright().start()
-            launcher = getattr(
-                self._pw,
-                self._cfg.get('browser_type', 'chromium'),
-                self._pw.chromium,
-            )
             browser_name = self._cfg.get('browser_type', 'chromium')
-            await self._ensure_browser_binary(launcher, browser_name)
-            self._browser = await self._launch_with_dependency_recovery(
-                launcher, browser_name
-            )
+            launcher = getattr(self._pw, browser_name)
+            self._browser = await self._launch_with_dependency_recovery(launcher, browser_name)
+            self._last_error = None
             log.info('✅ 浏览器已启动' if not restarting else '✅ 浏览器已重启')
             if not self._cfg.get('close_after_use', False):
                 self._start_idle_cleanup(30)
@@ -179,89 +186,75 @@ class PlaywrightRenderer(IdleEngine):
             return False
 
     async def _launch_with_dependency_recovery(self, launcher, browser_name):
-        """启动浏览器；检测到 Linux 动态库缺失时自动补装依赖后重试一次。"""
+        """缺失浏览器文件或 Linux 动态库时，补装后重试启动。"""
+        from playwright.async_api import Error
+
         launch_kwargs = {
             'headless': self._cfg.get('headless', True),
             'args': self._cfg.get('launch_args', []),
         }
         try:
             return await launcher.launch(**launch_kwargs)
-        except Exception as first_error:
+        except Error as first_error:
             if not self._cfg.get('auto_install_browser', True):
                 raise
             message = str(first_error)
-            missing_library = (
-                'error while loading shared libraries:' in message
+            missing_library = sys.platform.startswith('linux') and (
+                'Host system is missing dependencies to run browsers' in message
+                or 'error while loading shared libraries:' in message
                 or 'cannot open shared object file' in message
             )
-            if not missing_library:
+            if "Executable doesn't exist at" in message:
+                # 启用后若缓存被清理或只有主程序缺少 headless shell，按实际 launch 结果修复。
+                await self.prepare_browser()
+            elif missing_library:
+                log.warning(f'Playwright {browser_name} 缺少系统动态库，正在补装...')
+                await self._install_browser(browser_name, with_deps=True)
+            else:
                 raise
-            log.warning(
-                'Chromium 已安装但缺少系统动态库，尝试执行 playwright install --with-deps'
-            )
-            await self._install_browser_dependencies(browser_name)
             return await launcher.launch(**launch_kwargs)
 
-    async def _install_browser_dependencies(self, browser_name):
-        """安装 Playwright 浏览器及系统依赖；失败时保留命令输出。"""
-        command = [sys.executable, '-m', 'playwright', 'install', '--with-deps', browser_name]
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            env=os.environ.copy(),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        output, _ = await process.communicate()
-        if process.returncode != 0:
-            details = output.decode(errors='replace').strip() if output else ''
-            raise RuntimeError(
-                f'Playwright {browser_name} 系统依赖安装失败 (退出码 {process.returncode})'
-                + (f': {details[-1000:]}' if details else '')
-            )
-
-    async def _ensure_browser_binary(self, launcher, browser_name):
-        """确保当前环境已安装 Playwright 浏览器引擎。
-
-        Python 包安装不会自动下载浏览器；首次插件实际调用 Playwright 时，
-        这里使用当前运行中的 Python 解释器执行 ``playwright install``。
-        已存在的引擎直接复用，多个并发请求只会触发一次安装。
-        """
-        if not self._cfg.get('auto_install_browser', True):
-            return
-
-        executable = getattr(launcher, 'executable_path', None)
-        if executable and os.path.isfile(executable):
-            return
-
-        async with self._browser_install_lock:
-            # 等待其他协程安装完成后再次检查。
-            executable = getattr(launcher, 'executable_path', None)
-            if executable and os.path.isfile(executable):
-                return
-
-            log.info(f'未检测到 Playwright {browser_name} 浏览器，正在自动安装...')
-            command = [sys.executable, '-m', 'playwright', 'install']
-            if self._cfg.get('install_with_deps', False):
-                command.append('--with-deps')
-            command.append(browser_name)
-            # 保留虚拟环境和 Docker 中自定义的 PLAYWRIGHT_BROWSERS_PATH 等设置。
+    async def _install_browser(self, browser_name, *, with_deps=False):
+        # Playwright CLI 会复用当前版本的缓存并补齐缺失组件，包括 Chromium headless shell。
+        command = [sys.executable, '-m', 'playwright', 'install']
+        if with_deps:
+            command.append('--with-deps')
+        command.append(browser_name)
+        env = os.environ.copy()
+        # 子进程也需要看到运行时注入的 .pydeps 等依赖目录。
+        env['PYTHONPATH'] = os.pathsep.join(dict.fromkeys(os.path.abspath(path) for path in sys.path if path))
+        # 用文件接收输出，避免 Windows 上 Node 子进程持有输出管道导致等待卡住。
+        with tempfile.TemporaryFile() as output:
             process = await asyncio.create_subprocess_exec(
                 *command,
-                env=os.environ.copy(),
-                stdout=asyncio.subprocess.PIPE,
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=output,
                 stderr=asyncio.subprocess.STDOUT,
             )
-            output, _ = await process.communicate()
-            if process.returncode != 0:
-                details = output.decode(errors='replace').strip() if output else ''
+            try:
+                code = await asyncio.wait_for(process.wait(), _INSTALL_TIMEOUT)
+                reason = f'退出码 {code}'
+            except (TimeoutError, asyncio.CancelledError) as exc:
+                with contextlib.suppress(psutil.Error):
+                    for child in reversed(psutil.Process(process.pid).children(recursive=True)):
+                        with contextlib.suppress(psutil.Error):
+                            child.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                code = None
+                reason = f'超过 {_INSTALL_TIMEOUT} 秒'
+            if code != 0:
+                size = output.seek(0, os.SEEK_END)
+                output.seek(max(0, size - 4000))
+                details = output.read().decode('utf-8', errors='replace').strip()
                 raise RuntimeError(
-                    f'Playwright {browser_name} 自动安装失败 (退出码 {process.returncode})'
+                    f'Playwright {browser_name} 安装失败 ({reason})'
                     + (f': {details[-1000:]}' if details else '')
                 )
-
-            # executable_path 在不同 Playwright 版本中可能在安装后才解析；
-            # 若仍不存在，让 launch() 报出原生诊断，同时记录安装已完成。
-            log.info(f'✅ Playwright {browser_name} 浏览器安装完成')
 
     async def _release_idle(self):
         """空闲超时关闭浏览器"""

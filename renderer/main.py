@@ -24,7 +24,7 @@
 __module_meta__ = {
     'name': '渲染引擎',
     'description': 'PIL 子进程渲染池 + Playwright 浏览器渲染统一管理, 全局共享按需启停',
-    'version': '2.2.5',
+    'version': '2.2.6',
     'author': 'ElainaBot',
 }
 
@@ -70,10 +70,10 @@ async def setup(ctx):
     from modules.renderer.pil.main import _COMMENTS as PIL_COMMENTS
     from modules.renderer.pil.main import _DEFAULTS as PIL_DEFAULTS
     from modules.renderer.pil.main import PILRenderPool
-    from modules.renderer.protocol import _bind_pil_pool
     from modules.renderer.playwright.main import _COMMENTS as PW_COMMENTS
     from modules.renderer.playwright.main import _DEFAULTS as PW_DEFAULTS
     from modules.renderer.playwright.main import PlaywrightRenderer
+    from modules.renderer.protocol import _bind_pil_pool
 
     pil_cfg = ctx.ensure_config(PIL_DEFAULTS, filename='pil.yaml', comments=PIL_COMMENTS)
     legacy_keys = ('min_workers', 'resident_idle_timeout', 'start_method')
@@ -85,6 +85,7 @@ async def setup(ctx):
 
     pil_inst = None
     pw_inst = None
+    browser_setup_failed = False
 
     if cfg.get('pil_enabled', True):
         err = await _ensure_engine_deps('pil', 'PIL', 'Pillow')
@@ -98,7 +99,14 @@ async def setup(ctx):
         if err:
             log.error(f'Playwright 渲染已启用但不可用: {err}')
         else:
-            pw_inst = PlaywrightRenderer(pw_cfg)
+            try:
+                pw_inst = PlaywrightRenderer(pw_cfg)
+                await pw_inst.prepare_browser()
+            except ValueError as exc:
+                log.error(f'Playwright 配置无效: {exc}')
+            except (OSError, RuntimeError) as exc:
+                browser_setup_failed = True
+                log.warning(f'Playwright 浏览器准备失败，渲染时可重试: {exc}')
 
     _instance = Renderer(pil_inst, pw_inst)
     _bind_pil_pool(pil_inst)
@@ -115,7 +123,9 @@ async def setup(ctx):
     else:
         parts.append('PIL 关闭')
 
-    if pw_inst:
+    if browser_setup_failed:
+        parts.append(f'Playwright ⚠️ [{pw_cfg["browser_type"]} 首次调用时重试]')
+    elif pw_inst:
         parts.append(f'Playwright ✅ [{pw_cfg["browser_type"]} 首次调用时启动]')
     elif cfg.get('playwright_enabled'):
         parts.append('Playwright ❌')

@@ -50,10 +50,9 @@ image_bytes, width, height = await render_pil(
 
 ## Playwright 浏览器渲染
 
-通过 `renderer.playwright` 获取 `PlaywrightRenderer`。首次使用时启动浏览器。
-如果浏览器引擎尚未下载，首次启动会自动使用当前运行时执行
-`python -m playwright install <browser_type>`。因此在 Python 虚拟环境中会安装到该虚拟环境所使用的 Playwright 缓存，
-在 Docker 中会安装到容器环境，不会调用宿主机 Python。
+通过 `renderer.playwright` 获取 `PlaywrightRenderer`。启用或重载模块时，模块用当前 Python 运行
+`python -m playwright install <browser_type>`，复用 Playwright 缓存并补齐缺失的浏览器组件。
+浏览器进程仍在首次使用时启动。如果下载失败或缓存被清理，启动时会根据缺失文件错误重试安装。
 
 `playwright.yaml` 中可配置：
 
