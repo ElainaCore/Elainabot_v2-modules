@@ -25,6 +25,7 @@
 import asyncio
 import contextlib
 import os
+import shutil
 import sys
 import tempfile
 from contextlib import asynccontextmanager
@@ -47,6 +48,7 @@ _DEFAULTS = {
     'image_quality': 90,
     'browser_type': 'chromium',
     'auto_install_browser': True,
+    'executable_path': '',
     'install_with_deps': False,
     'close_after_use': False,
     'launch_args': [
@@ -79,10 +81,58 @@ _COMMENTS = {
     'image_quality': '截图质量 (仅 jpeg, 1-100)',
     'browser_type': '浏览器类型: chromium / firefox / webkit',
     'auto_install_browser': '浏览器缺失时是否自动下载 Playwright 引擎',
+    'executable_path': '可选浏览器可执行文件路径；留空时自动复用系统 Chromium / Chrome / Edge',
     'install_with_deps': '安装浏览器时是否同时安装系统依赖 (Docker/Linux 需要 root 和 apt)',
     'close_after_use': '用完即关: 每次调用结束后完全关闭浏览器进程, 不保留常驻进程 (适合低内存环境)',
     'launch_args': '浏览器启动参数',
 }
+
+
+def _system_browser_executable(browser):
+    """查找可复用的系统 Chromium 浏览器，避免服务器必须下载 Playwright 浏览器。"""
+    if browser != 'chromium':
+        return ''
+    candidates = []
+    if os.name == 'nt':
+        roots = [
+            os.environ.get('PROGRAMFILES'),
+            os.environ.get('PROGRAMFILES(X86)'),
+            os.environ.get('LOCALAPPDATA'),
+        ]
+        for root in filter(None, roots):
+            candidates.extend((
+                os.path.join(root, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+                os.path.join(root, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+            ))
+    elif sys.platform == 'darwin':
+        candidates.extend((
+            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        ))
+    else:
+        for name in (
+            'chromium',
+            'chromium-browser',
+            'google-chrome',
+            'google-chrome-stable',
+            'microsoft-edge',
+            'microsoft-edge-stable',
+        ):
+            path = shutil.which(name)
+            if path:
+                candidates.append(path)
+    return next((path for path in candidates if os.path.isfile(path)), '')
+
+
+def _resolve_browser_executable(cfg):
+    """返回配置指定或系统可用的 Chromium 可执行文件。"""
+    configured = str(cfg.get('executable_path') or '').strip()
+    if configured:
+        path = os.path.abspath(os.path.expandvars(os.path.expanduser(configured)))
+        if not os.path.isfile(path):
+            raise ValueError(f'浏览器 executable_path 不存在: {path}')
+        return path
+    return _system_browser_executable(cfg.get('browser_type', 'chromium'))
 
 
 # ==================== 浏览器渲染器 ====================
@@ -112,6 +162,10 @@ class PlaywrightRenderer(IdleEngine):
 
     async def prepare_browser(self):
         """由渲染模块在启用时补齐浏览器，实际浏览器进程仍按需启动。"""
+        executable = _resolve_browser_executable(self._cfg)
+        if executable:
+            log.info(f'使用系统 Chromium 浏览器: {executable}')
+            return
         if not self._cfg.get('auto_install_browser', True):
             return
         browser = self._cfg.get('browser_type', 'chromium')
@@ -193,6 +247,9 @@ class PlaywrightRenderer(IdleEngine):
             'headless': self._cfg.get('headless', True),
             'args': self._cfg.get('launch_args', []),
         }
+        executable = _resolve_browser_executable(self._cfg)
+        if executable:
+            launch_kwargs['executable_path'] = executable
         try:
             return await launcher.launch(**launch_kwargs)
         except Error as first_error:
